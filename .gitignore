@@ -1,0 +1,23 @@
+# PlatformIO
+.pio/
+.vscode/
+.clang_complete
+.gcc-flags.json
+
+# Secrets (DO NOT commit WiFi passwords or GitHub tokens!)
+# include/secrets.h  # Uncomment this if you want to keep secrets private
+
+# Build files
+*.bin
+*.elf
+*.map
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE
+*.code-workspace
+.idea/
