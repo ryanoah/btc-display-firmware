@@ -31,7 +31,7 @@
 #define CHART_X       0
 #define CHART_Y       28
 #define CHART_WIDTH   240
-#define CHART_HEIGHT  100
+#define CHART_HEIGHT  107  // Full screen minus header (135-28)
 
 // ========== UPDATE INTERVALS ==========
 #define PRICE_UPDATE_INTERVAL_BASE    60000    // 60 seconds
@@ -40,7 +40,7 @@
 
 // ========== COLOR SCHEME ==========
 #define COLOR_BG       0x0000
-#define COLOR_HEADER   0x001F
+#define COLOR_HEADER   0x0000  // Black header
 #define COLOR_TEXT     0xFFFF
 #define COLOR_GRID     0x2104
 #define COLOR_CHART    0x07E0
@@ -69,9 +69,12 @@ void connectWifi();
 String stripChunkedEncoding(const String& raw);
 bool fetchCurrentPrice(float& out);
 bool fetchWeekPrices(std::vector<float>& out);
-void drawHeader(const String& price, bool netOk = true);
+void drawHeader();
+void drawPrice(const String& price, bool netOk = true);
 void drawGrid(int x, int y, int w, int h);
 void drawSeries(const std::vector<float>& s, int x, int y, int w, int h);
+void drawChartLabels(const std::vector<float>& s, int x, int y, int w, int h);
+String formatPrice(float price);
 bool checkForFirmwareUpdate();
 void performFirmwareUpdate(const String& firmwareUrl);
 void handleButton();
@@ -115,28 +118,44 @@ void connectWifi() {
 
 // ========== CHUNKED ENCODING PARSER ==========
 String stripChunkedEncoding(const String& raw) {
+  if (raw.length() == 0) return "";
+
+  // Check if this looks like chunked encoding
+  // Chunked responses start with a hex number on the first line
+  int firstLineEnd = raw.indexOf('\n');
+  if (firstLineEnd == -1) return raw; // No newlines, return as-is
+
+  String firstLine = raw.substring(0, firstLineEnd);
+  firstLine.trim();
+
+  // Try to parse as hex - if it fails (returns 0) and the line isn't actually "0",
+  // then this probably isn't chunked encoding
+  char* endPtr;
+  long firstChunkSize = strtol(firstLine.c_str(), &endPtr, 16);
+
+  // If no characters were parsed, or if it's not a valid hex, return raw
+  if (endPtr == firstLine.c_str() || (*endPtr != '\0' && *endPtr != '\r' && *endPtr != ' ')) {
+    Serial.println("[DEBUG] Not chunked encoded, returning raw");
+    return raw;
+  }
+
+  // Looks like chunked encoding, proceed with parsing
   String result = "";
   int pos = 0;
 
   while (pos < raw.length()) {
-    // Find the end of the chunk size line
     int lineEnd = raw.indexOf('\n', pos);
     if (lineEnd == -1) break;
 
-    // Extract chunk size (hex string)
     String chunkSizeLine = raw.substring(pos, lineEnd);
     chunkSizeLine.trim();
 
-    // Parse hex chunk size
     long chunkSize = strtol(chunkSizeLine.c_str(), NULL, 16);
 
-    // If chunk size is 0, we're done
     if (chunkSize == 0) break;
 
-    // Move past the chunk size line
     pos = lineEnd + 1;
 
-    // Read the chunk data
     if (pos + chunkSize <= raw.length()) {
       result += raw.substring(pos, pos + chunkSize);
       pos += chunkSize;
@@ -144,7 +163,6 @@ String stripChunkedEncoding(const String& raw) {
       break;
     }
 
-    // Skip the trailing \r\n after chunk data
     if (pos < raw.length() && raw.charAt(pos) == '\r') pos++;
     if (pos < raw.length() && raw.charAt(pos) == '\n') pos++;
   }
@@ -235,9 +253,9 @@ bool fetchWeekPrices(std::vector<float>& out) {
 
   const char* host = "api.coingecko.com";
   const int httpsPort = 443;
-  const String url = "/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=7";
+  const String url = "/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=7&interval=daily";
 
-  Serial.println("[API] Fetching 7-day chart data...");
+  Serial.println("[API] Fetching 7-day daily chart data...");
 
   if (!client.connect(host, httpsPort)) {
     Serial.println("[API] Connection failed!");
@@ -298,6 +316,8 @@ bool fetchWeekPrices(std::vector<float>& out) {
 
   JsonArray prices = doc["prices"].as<JsonArray>();
   out.clear();
+
+  // Get all daily data points
   for (JsonArray pricePoint : prices) {
     if (pricePoint.size() >= 2) {
       float price = pricePoint[1].as<float>();
@@ -305,23 +325,28 @@ bool fetchWeekPrices(std::vector<float>& out) {
     }
   }
 
-  Serial.println("[API] Got " + String(out.size()) + " data points");
+  Serial.println("[API] Got " + String(out.size()) + " daily data points");
   return out.size() > 0;
 }
 
 // ========== DISPLAY ==========
-void drawHeader(const String& price, bool netOk) {
+void drawHeader() {
   tft.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, COLOR_HEADER);
   tft.setTextColor(COLOR_TEXT, COLOR_HEADER);
-  tft.setTextDatum(ML_DATUM);
-  tft.drawString("BTC LIVE", 5, HEADER_HEIGHT / 2, 2);
-  tft.setTextDatum(MR_DATUM);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("BTC", SCREEN_WIDTH / 2, HEADER_HEIGHT / 2, 2);
+}
 
-  if (netOk && price.length() > 0)
-    tft.drawString("$" + price, SCREEN_WIDTH - 5, HEADER_HEIGHT / 2, 2);
-  else {
-    tft.setTextColor(COLOR_ERROR, COLOR_HEADER);
-    tft.drawString("NO DATA", SCREEN_WIDTH - 5, HEADER_HEIGHT / 2, 2);
+void drawPrice(const String& price, bool netOk) {
+  // Draw price in center of screen (transparent, over the chart background)
+  tft.setTextDatum(MC_DATUM);
+
+  if (netOk && price.length() > 0) {
+    tft.setTextColor(COLOR_TEXT);  // No background - transparent text
+    tft.drawString("$" + price, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 4);
+  } else {
+    tft.setTextColor(COLOR_ERROR);  // No background - transparent text
+    tft.drawString("NO DATA", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 4);
   }
 }
 
@@ -347,7 +372,46 @@ void drawSeries(const std::vector<float>& s, int x, int y, int w, int h) {
     int y1 = y + h - (int)((s[i - 1] - minPrice) / range * h);
     int x2 = x + (w * i) / (s.size() - 1);
     int y2 = y + h - (int)((s[i] - minPrice) / range * h);
-    tft.drawLine(x1, y1, x2, y2, COLOR_CHART);
+
+    // Color line based on price movement: green if up, red if down
+    uint16_t lineColor = (s[i] >= s[i - 1]) ? COLOR_CHART : COLOR_ERROR;
+    tft.drawLine(x1, y1, x2, y2, lineColor);
+  }
+}
+
+String formatPrice(float price) {
+  if (price >= 1000.0) {
+    int k = (int)(price / 1000.0);
+    return String(k) + "k";
+  }
+  return String((int)price);
+}
+
+void drawChartLabels(const std::vector<float>& s, int x, int y, int w, int h) {
+  if (s.size() < 2) return;
+
+  // Calculate min/max prices (same logic as drawSeries)
+  float minPrice = s[0], maxPrice = s[0];
+  for (float p : s) { if (p < minPrice) minPrice = p; if (p > maxPrice) maxPrice = p; }
+  float range = maxPrice - minPrice; if (range < 1.0) range = 1.0;
+  minPrice -= range * 0.05; maxPrice += range * 0.05;
+
+  // Draw price labels on the left side
+  tft.setTextColor(COLOR_GRID, COLOR_BG);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextSize(1);
+
+  // Max price at top
+  tft.drawString(formatPrice(maxPrice), x + 2, y + 2, 1);
+
+  // Min price at bottom
+  tft.drawString(formatPrice(minPrice), x + 2, y + h - 10, 1);
+
+  // Day markers at bottom (1 data point per day for daily intervals)
+  tft.setTextDatum(TC_DATUM);
+  for (int day = 0; day < s.size() && day <= 7; day++) {
+    int xPos = x + (w * day) / (s.size() - 1);
+    tft.drawString(String(day), xPos, y + h - 9, 1);
   }
 }
 
@@ -377,10 +441,34 @@ void setup() {
   if (wifiConnected) {
     tft.fillScreen(COLOR_BG);
     tft.drawString("Loading data...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 2);
+
+    // Fetch current price immediately
     fetchCurrentPrice(currentPrice);
-    fetchWeekPrices(weekPrices);
+
+    // Draw header with BTC label
+    drawHeader();
+
+    // Wait 20 seconds before fetching chart data (within 30 sec window)
+    delay(20000);
+
+    // Fetch 7-day chart data
+    tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
+    if (fetchWeekPrices(weekPrices)) {
+      drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+      drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+      drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+    }
+
+    // Draw large price on top of chart
+    drawPrice(String(currentPrice, 2), currentPrice > 0);
+
+    // Set timestamp so next chart update happens in 15 minutes
+    lastChartUpdate = millis();
+    lastPriceUpdate = millis();
+
   } else {
     tft.fillScreen(COLOR_BG);
+    drawHeader();
     tft.setTextColor(COLOR_ERROR, COLOR_BG);
     tft.drawString("WiFi Error!", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 4);
   }
@@ -406,8 +494,19 @@ void loop() {
   if (now - lastPriceUpdate >= PRICE_UPDATE_INTERVAL) {
     Serial.println("\n[UPDATE] Fetching price...");
     bool success = fetchCurrentPrice(currentPrice);
-    if (success) drawHeader(String(currentPrice, 2), true);
-    else drawHeader("", false);
+
+    // Redraw chart area background
+    tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
+
+    // Draw chart if we have data
+    if (weekPrices.size() > 0) {
+      drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+      drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+      drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+    }
+
+    // Draw large price on top of chart
+    drawPrice(String(currentPrice, 2), success);
 
     // Always update timestamp even if failed
     lastPriceUpdate = now;
@@ -422,6 +521,9 @@ void loop() {
       tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
       drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+      drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+      // Redraw price on top
+      drawPrice(String(currentPrice, 2), currentPrice > 0);
     }
     lastChartUpdate = now;
     CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE + random(0, 30000);
