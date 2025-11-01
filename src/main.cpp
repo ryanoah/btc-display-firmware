@@ -409,10 +409,18 @@ bool checkForFirmwareUpdate() {
     }
   }
 
-  // Skip HTTP headers
+  // Skip HTTP headers and check status code
   bool headersEnded = false;
+  int httpCode = 0;
   while (client.available()) {
     String line = client.readStringUntil('\n');
+
+    // Check HTTP status code
+    if (line.startsWith("HTTP/1.1")) {
+      httpCode = line.substring(9, 12).toInt();
+      Serial.println("[OTA] HTTP Status: " + String(httpCode));
+    }
+
     if (line == "\r") {
       headersEnded = true;
       break;
@@ -425,9 +433,33 @@ bool checkForFirmwareUpdate() {
     return false;
   }
 
+  // Check for common HTTP errors
+  if (httpCode == 404) {
+    Serial.println("[OTA] ERROR: Repository or release not found!");
+    Serial.println("[OTA] Check: https://github.com/" + String(GITHUB_REPO) + "/releases");
+    client.stop();
+    return false;
+  } else if (httpCode == 403) {
+    Serial.println("[OTA] ERROR: Rate limited or access forbidden!");
+    Serial.println("[OTA] Wait an hour and try again, or use a GitHub token");
+    client.stop();
+    return false;
+  } else if (httpCode != 200) {
+    Serial.println("[OTA] ERROR: Unexpected HTTP code: " + String(httpCode));
+    client.stop();
+    return false;
+  }
+
   // Read JSON body
   String payload = client.readString();
   client.stop();
+
+  Serial.println("[OTA] Response size: " + String(payload.length()) + " bytes");
+
+  // Print first 200 chars for debugging
+  if (payload.length() > 0) {
+    Serial.println("[OTA] Response preview: " + payload.substring(0, min(200, (int)payload.length())));
+  }
 
   // Parse JSON
   JsonDocument doc;
@@ -435,6 +467,7 @@ bool checkForFirmwareUpdate() {
 
   if (error) {
     Serial.println("[OTA] JSON parsing failed: " + String(error.c_str()));
+    Serial.println("[OTA] Payload length: " + String(payload.length()));
     return false;
   }
 
