@@ -118,6 +118,7 @@ bool checkIfPluggedIn();
 void drawBatteryWarning();
 void shutdownDevice(const String& reason);
 void configurePowerSaving();
+int compareSemanticVersion(const String& v1, const String& v2);
 
 // ========== WIFI CONNECTION ==========
 void connectWifi() {
@@ -474,6 +475,65 @@ bool fetchWeekPrices(std::vector<float>& out) {
   return out.size() > 0;
 }
 
+// ========== SEMANTIC VERSION COMPARISON ==========
+/**
+ * Compare two semantic version strings (e.g., "1.2.3" vs "1.10.0")
+ * Returns: -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
+ */
+int compareSemanticVersion(const String& v1, const String& v2) {
+  // Parse version components
+  int v1Major = 0, v1Minor = 0, v1Patch = 0;
+  int v2Major = 0, v2Minor = 0, v2Patch = 0;
+
+  // Parse v1
+  int firstDot = v1.indexOf('.');
+  int secondDot = v1.indexOf('.', firstDot + 1);
+  if (firstDot > 0) {
+    v1Major = v1.substring(0, firstDot).toInt();
+    if (secondDot > firstDot) {
+      v1Minor = v1.substring(firstDot + 1, secondDot).toInt();
+      v1Patch = v1.substring(secondDot + 1).toInt();
+    } else {
+      v1Minor = v1.substring(firstDot + 1).toInt();
+    }
+  } else {
+    v1Major = v1.toInt();
+  }
+
+  // Parse v2
+  firstDot = v2.indexOf('.');
+  secondDot = v2.indexOf('.', firstDot + 1);
+  if (firstDot > 0) {
+    v2Major = v2.substring(0, firstDot).toInt();
+    if (secondDot > firstDot) {
+      v2Minor = v2.substring(firstDot + 1, secondDot).toInt();
+      v2Patch = v2.substring(secondDot + 1).toInt();
+    } else {
+      v2Minor = v2.substring(firstDot + 1).toInt();
+    }
+  } else {
+    v2Major = v2.toInt();
+  }
+
+  // Compare major version
+  if (v1Major != v2Major) {
+    return (v1Major < v2Major) ? -1 : 1;
+  }
+
+  // Compare minor version
+  if (v1Minor != v2Minor) {
+    return (v1Minor < v2Minor) ? -1 : 1;
+  }
+
+  // Compare patch version
+  if (v1Patch != v2Patch) {
+    return (v1Patch < v2Patch) ? -1 : 1;
+  }
+
+  // Versions are equal
+  return 0;
+}
+
 // ========== GITHUB OTA FUNCTIONS ==========
 bool checkForFirmwareUpdate() {
   Serial.println("\n[OTA] Checking for firmware updates...");
@@ -530,16 +590,20 @@ bool checkForFirmwareUpdate() {
   String latestVersion = doc["tag_name"].as<String>();
 
   // Remove 'v' prefix if present (e.g., "v1.0.3" -> "1.0.3")
-  if (latestVersion.startsWith("v")) {
+  if (latestVersion.startsWith("v") || latestVersion.startsWith("V")) {
     latestVersion = latestVersion.substring(1);
   }
 
   Serial.println("[OTA] Current version: " + String(FIRMWARE_VERSION));
   Serial.println("[OTA] Latest version: " + latestVersion);
 
-  // Simple version comparison (works for semantic versioning)
-  if (latestVersion != String(FIRMWARE_VERSION) && latestVersion.length() > 0) {
-    Serial.println("[OTA] 🆕 New version available!");
+  // Semantic version comparison (handles versions like 1.2.0 vs 1.10.0 correctly)
+  if (latestVersion.length() > 0) {
+    int versionCompare = compareSemanticVersion(String(FIRMWARE_VERSION), latestVersion);
+
+    if (versionCompare < 0) {
+      // Current version is older than latest version
+      Serial.println("[OTA] 🆕 New version available!");
 
     // Find the firmware.bin asset
     JsonArray assets = doc["assets"].as<JsonArray>();
@@ -554,10 +618,19 @@ bool checkForFirmwareUpdate() {
       }
     }
 
-    Serial.println("[OTA] ⚠️ No firmware.bin found in release assets!");
-    return false;
+      Serial.println("[OTA] ⚠️ No firmware.bin found in release assets!");
+      return false;
+    } else if (versionCompare > 0) {
+      // Current version is newer than latest release (dev build?)
+      Serial.println("[OTA] ℹ️ Current version is newer than latest release (development build?)");
+      return false;
+    } else {
+      // Versions are equal
+      Serial.println("[OTA] ✅ Firmware is up to date");
+      return false;
+    }
   } else {
-    Serial.println("[OTA] ✅ Firmware is up to date");
+    Serial.println("[OTA] ⚠️ Invalid version format from GitHub");
     return false;
   }
 }
@@ -632,9 +705,12 @@ void performFirmwareUpdate(const String& firmwareUrl) {
 // ========== DISPLAY ==========
 void drawHeader() {
   tft.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, COLOR_HEADER);
+
+  // Draw BTC label - larger and more prominent
   tft.setTextColor(COLOR_TEXT, COLOR_HEADER);
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString("BTC", SCREEN_WIDTH / 2, HEADER_HEIGHT / 2, 2);
+  tft.setTextDatum(ML_DATUM);  // Middle-left alignment
+  tft.drawString("BTC", 5, HEADER_HEIGHT / 2, 4);  // Font size 4, left-aligned with 5px padding
+
   drawBatteryWarning();  // Draw battery warning if needed
 }
 
@@ -796,7 +872,7 @@ void setup() {
     }
 
     if (priceNeedsRedraw) {
-      drawPrice(String(currentPrice, 2), currentPrice > 0);
+      drawPrice(String((int)currentPrice), currentPrice > 0);
       priceNeedsRedraw = false;
       Serial.println("[INIT] Price drawn");
     }
@@ -934,7 +1010,7 @@ void loop() {
           drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
         }
 
-        drawPrice(String(currentPrice, 2), success);
+        drawPrice(String((int)currentPrice), success);
         drawBatteryWarning();
       }
 
@@ -952,7 +1028,7 @@ void loop() {
         drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
         drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
         drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-        drawPrice(String(currentPrice, 2), currentPrice > 0);
+        drawPrice(String((int)currentPrice), currentPrice > 0);
         drawBatteryWarning();
       }
 
