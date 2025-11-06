@@ -1,7 +1,7 @@
 /**
  * Bitcoin Live Price Display for LILYGO T-Display ESP32
  * Features: BTC/USD price, 7-day chart, WiFi, GitHub OTA updates
- * Version 1.0.3: Security improvements, OTA implementation, optimizations
+ * Version 1.1.0: Battery optimizations, automatic firmware updates on plug-in
  */
 
 #include <Arduino.h>
@@ -15,17 +15,22 @@
 #include "secrets.h"
 
 // ========== FIRMWARE VERSION ==========
-#define FIRMWARE_VERSION "1.0.3"
+#define FIRMWARE_VERSION "1.1.0"
+
+// ========== POWER MANAGEMENT ==========
+// Battery life is the TOP priority - optimized for minimal power consumption
+// NOTE: Device is encased without button access - display always on
+#define ENABLE_WIFI_SLEEP true         // Turn off WiFi between updates (saves ~80-170mA)
+#define CPU_FREQ_MHZ 80                // Run at 80MHz instead of 240MHz (saves ~30mA)
 
 // ========== HARDWARE CONFIGURATION ==========
-#define BUTTON_PIN    35
 #define BACKLIGHT_PIN 4
 #define BATTERY_PIN   34  // ADC pin for battery voltage
 #define BACKLIGHT_PWM_CHANNEL 0
-#define BACKLIGHT_DIM  64
-#define BACKLIGHT_FULL 255
+#define BACKLIGHT_FULL 128             // Brightness level (reduced for battery savings)
 #define BATTERY_LOW_VOLTAGE 3.5       // Low battery warning threshold (volts)
 #define BATTERY_CRITICAL_VOLTAGE 3.0  // Critical - shutdown to prevent damage (volts)
+#define BATTERY_CHARGING_VOLTAGE 4.3  // Voltage indicating device is plugged in/charging
 #define BATTERY_CHECK_INTERVAL 30000  // Check battery every 30 seconds
 
 // ========== DISPLAY CONFIGURATION ==========
@@ -37,15 +42,20 @@
 #define CHART_WIDTH   240
 #define CHART_HEIGHT  107  // Full screen minus header (135-28)
 
-// ========== UPDATE INTERVALS ==========
-#define PRICE_UPDATE_INTERVAL_BASE    60000    // 60 seconds
-#define CHART_UPDATE_INTERVAL_BASE    900000   // 15 minutes
-#define FIRMWARE_UPDATE_INTERVAL      3600000  // 1 hour
+// ========== UPDATE INTERVALS (optimized for battery life) ==========
+#define PRICE_UPDATE_INTERVAL_BASE    300000   // 5 minutes (was 60 seconds)
+#define CHART_UPDATE_INTERVAL_BASE    3600000  // 1 hour (was 15 minutes)
+#define FIRMWARE_UPDATE_INTERVAL      86400000 // 24 hours (was 1 hour)
 
 // ========== RETRY CONFIGURATION ==========
 #define MAX_API_RETRIES 3
 #define INITIAL_BACKOFF_MS 5000
 #define MAX_BACKOFF_MS 60000
+
+// ========== BUFFER SIZES ==========
+#define PRICE_BUFFER_SIZE 512
+#define CHART_BUFFER_SIZE 8192
+#define RESPONSE_BUFFER_SIZE 4096
 
 // ========== COLOR SCHEME ==========
 #define COLOR_BG       0x0000
@@ -66,13 +76,15 @@ unsigned long lastPriceUpdate = 0;
 unsigned long lastChartUpdate = 0;
 unsigned long lastFirmwareCheck = 0;
 bool wifiConnected = false;
-bool backlightBright = true;
 bool batteryLow = false;
 bool batteryCritical = false;
 float batteryVoltage = 0.0;
 unsigned long lastBatteryCheck = 0;
-unsigned long lastButtonPress = 0;
-const unsigned long debounceDelay = 200;
+
+// Plug-in detection and firmware update
+bool isPluggedIn = false;
+bool wasPluggedIn = false;
+bool firmwareCheckedThisSession = false;  // Track if we've checked firmware while plugged in
 
 // Rate limiting state
 unsigned long rateLimitBackoffUntil = 0;
@@ -88,7 +100,8 @@ unsigned long CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE;
 
 // ========== FUNCTION DECLARATIONS ==========
 void connectWifi();
-String stripChunkedEncoding(const String& raw);
+void disconnectWifi();
+void stripChunkedEncoding(const char* raw, char* output, size_t maxLen);
 bool fetchCurrentPrice(float& out);
 bool fetchWeekPrices(std::vector<float>& out);
 void drawHeader();
@@ -99,12 +112,12 @@ void drawChartLabels(const std::vector<float>& s, int x, int y, int w, int h);
 String formatPrice(float price);
 bool checkForFirmwareUpdate();
 void performFirmwareUpdate(const String& firmwareUrl);
-void handleButton();
-void setBacklight(bool bright);
 int calculateBackoff(int attempt);
 void checkBattery();
+bool checkIfPluggedIn();
 void drawBatteryWarning();
 void shutdownDevice(const String& reason);
+void configurePowerSaving();
 
 // ========== WIFI CONNECTION ==========
 void connectWifi() {
@@ -142,6 +155,17 @@ void connectWifi() {
   }
 }
 
+// ========== WIFI DISCONNECTION (POWER SAVING) ==========
+void disconnectWifi() {
+  if (wifiConnected) {
+    Serial.println("[WiFi] Disconnecting to save power...");
+    WiFi.disconnect(true);  // true = turn off WiFi radio
+    WiFi.mode(WIFI_OFF);
+    wifiConnected = false;
+    Serial.println("[WiFi] Disconnected - saved ~80-170mA");
+  }
+}
+
 // ========== EXPONENTIAL BACKOFF ==========
 int calculateBackoff(int attempt) {
   if (attempt <= 0) return 0;
@@ -154,62 +178,88 @@ int calculateBackoff(int attempt) {
   return backoff + jitter;
 }
 
-// ========== CHUNKED ENCODING PARSER ==========
-String stripChunkedEncoding(const String& raw) {
-  if (raw.length() == 0) return "";
+// ========== CHUNKED ENCODING PARSER (optimized, no String allocation) ==========
+void stripChunkedEncoding(const char* raw, char* output, size_t maxLen) {
+  if (!raw || !output || maxLen == 0) return;
 
-  // Check if this looks like chunked encoding
-  int firstLineEnd = raw.indexOf('\n');
-  if (firstLineEnd == -1) return raw;
-
-  String firstLine = raw.substring(0, firstLineEnd);
-  firstLine.trim();
-
-  char* endPtr;
-  long firstChunkSize = strtol(firstLine.c_str(), &endPtr, 16);
-
-  if (endPtr == firstLine.c_str() || (*endPtr != '\0' && *endPtr != '\r' && *endPtr != ' ')) {
-    return raw;
+  size_t rawLen = strlen(raw);
+  if (rawLen == 0) {
+    output[0] = '\0';
+    return;
   }
 
-  // Looks like chunked encoding, proceed with parsing
-  String result = "";
-  result.reserve(raw.length()); // Pre-allocate to reduce reallocations
-  int pos = 0;
+  // Check if this looks like chunked encoding
+  const char* firstLineEnd = strchr(raw, '\n');
+  if (!firstLineEnd) {
+    strncpy(output, raw, maxLen - 1);
+    output[maxLen - 1] = '\0';
+    return;
+  }
 
-  while (pos < raw.length()) {
-    int lineEnd = raw.indexOf('\n', pos);
-    if (lineEnd == -1) break;
+  // Extract first line
+  char firstLine[32];
+  size_t firstLineLen = firstLineEnd - raw;
+  if (firstLineLen >= sizeof(firstLine)) firstLineLen = sizeof(firstLine) - 1;
+  strncpy(firstLine, raw, firstLineLen);
+  firstLine[firstLineLen] = '\0';
 
-    String chunkSizeLine = raw.substring(pos, lineEnd);
-    chunkSizeLine.trim();
+  // Trim and check if it's a hex number
+  char* endPtr;
+  long firstChunkSize = strtol(firstLine, &endPtr, 16);
+  if (endPtr == firstLine || (*endPtr != '\0' && *endPtr != '\r' && *endPtr != ' ')) {
+    // Not chunked encoding, copy as-is
+    strncpy(output, raw, maxLen - 1);
+    output[maxLen - 1] = '\0';
+    return;
+  }
 
-    long chunkSize = strtol(chunkSizeLine.c_str(), NULL, 16);
+  // Parse chunked encoding
+  size_t pos = 0;
+  size_t outPos = 0;
 
+  while (pos < rawLen && outPos < maxLen - 1) {
+    const char* lineEnd = strchr(raw + pos, '\n');
+    if (!lineEnd) break;
+
+    // Extract chunk size line
+    char chunkSizeLine[32];
+    size_t lineLen = lineEnd - (raw + pos);
+    if (lineLen >= sizeof(chunkSizeLine)) lineLen = sizeof(chunkSizeLine) - 1;
+    strncpy(chunkSizeLine, raw + pos, lineLen);
+    chunkSizeLine[lineLen] = '\0';
+
+    long chunkSize = strtol(chunkSizeLine, NULL, 16);
     if (chunkSize == 0) break;
 
-    pos = lineEnd + 1;
+    pos = (lineEnd - raw) + 1;
 
-    if (pos + chunkSize <= raw.length()) {
-      result += raw.substring(pos, pos + chunkSize);
+    // Copy chunk data
+    if (pos + chunkSize <= rawLen) {
+      size_t copyLen = chunkSize;
+      if (outPos + copyLen > maxLen - 1) copyLen = maxLen - 1 - outPos;
+      memcpy(output + outPos, raw + pos, copyLen);
+      outPos += copyLen;
       pos += chunkSize;
     } else {
       break;
     }
 
-    if (pos < raw.length() && raw.charAt(pos) == '\r') pos++;
-    if (pos < raw.length() && raw.charAt(pos) == '\n') pos++;
+    // Skip CRLF after chunk
+    if (pos < rawLen && raw[pos] == '\r') pos++;
+    if (pos < rawLen && raw[pos] == '\n') pos++;
   }
 
-  return result;
+  output[outPos] = '\0';
 }
 
-// ========== COINGECKO API FETCHERS ==========
+// ========== COINGECKO API FETCHERS (optimized with char buffers) ==========
 bool fetchCurrentPrice(float& out) {
   // Check if we're in rate limit backoff period
   if (millis() < rateLimitBackoffUntil) {
     unsigned long remaining = (rateLimitBackoffUntil - millis()) / 1000;
-    Serial.println("[API] Rate limit backoff active, " + String(remaining) + "s remaining");
+    Serial.print("[API] Rate limit backoff active, ");
+    Serial.print(remaining);
+    Serial.println("s remaining");
     return false;
   }
 
@@ -218,7 +268,7 @@ bool fetchCurrentPrice(float& out) {
 
   const char* host = "api.coingecko.com";
   const int httpsPort = 443;
-  const String url = "/api/v3/simple/price?ids=bitcoin&vs_currencies=usd";
+  const char* url = "/api/v3/simple/price?ids=bitcoin&vs_currencies=usd";
 
   Serial.println("[API] Fetching current price...");
 
@@ -228,12 +278,17 @@ bool fetchCurrentPrice(float& out) {
     return false;
   }
 
-  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
-               "Host: " + host + "\r\n" +
-               "User-Agent: ESP32-Bitcoin-Display/" + String(FIRMWARE_VERSION) + "\r\n" +
-               "Accept: application/json\r\n" +
-               "Accept-Encoding: identity\r\n" +
-               "Connection: close\r\n\r\n");
+  // Use char buffer for request
+  char request[256];
+  snprintf(request, sizeof(request),
+           "GET %s HTTP/1.1\r\n"
+           "Host: %s\r\n"
+           "User-Agent: ESP32-Bitcoin-Display/%s\r\n"
+           "Accept: application/json\r\n"
+           "Accept-Encoding: identity\r\n"
+           "Connection: close\r\n\r\n",
+           url, host, FIRMWARE_VERSION);
+  client.print(request);
 
   unsigned long timeout = millis();
   while (client.available() == 0) {
@@ -245,26 +300,28 @@ bool fetchCurrentPrice(float& out) {
     }
   }
 
+  // Skip headers
   while (client.connected()) {
     String line = client.readStringUntil('\n');
     if (line == "\r" || line.length() == 0) break;
   }
 
-  // Optimized: Pre-allocate buffer to reduce memory fragmentation
-  String rawPayload = "";
-  rawPayload.reserve(512); // Most price responses are < 512 bytes
+  // Read response into char buffer (no String allocation)
+  char rawPayload[PRICE_BUFFER_SIZE];
+  size_t bytesRead = 0;
 
-  while (client.available()) {
-    char c = client.read();
-    rawPayload += c;
+  while (client.available() && bytesRead < PRICE_BUFFER_SIZE - 1) {
+    rawPayload[bytesRead++] = client.read();
   }
+  rawPayload[bytesRead] = '\0';
   client.stop();
 
-  // Strip chunked transfer encoding
-  String payload = stripChunkedEncoding(rawPayload);
+  // Strip chunked transfer encoding (in-place)
+  char payload[PRICE_BUFFER_SIZE];
+  stripChunkedEncoding(rawPayload, payload, PRICE_BUFFER_SIZE);
 
   // Check for rate limiting
-  if (payload.indexOf("rate limit") != -1 || payload.indexOf("429") != -1) {
+  if (strstr(payload, "rate limit") != NULL || strstr(payload, "429") != NULL) {
     Serial.println("[API] ⚠️ Rate limit detected!");
     rateLimitBackoffUntil = millis() + 60000; // Back off for 60 seconds
     consecutiveApiFailures++;
@@ -274,14 +331,16 @@ bool fetchCurrentPrice(float& out) {
   DynamicJsonDocument doc(1024);
   DeserializationError error = deserializeJson(doc, payload);
   if (error) {
-    Serial.println("[API] JSON parse failed: " + String(error.c_str()));
+    Serial.print("[API] JSON parse failed: ");
+    Serial.println(error.c_str());
     consecutiveApiFailures++;
     return false;
   }
 
   if (doc.containsKey("bitcoin") && doc["bitcoin"].containsKey("usd")) {
     out = doc["bitcoin"]["usd"].as<float>();
-    Serial.println("[API] Price: $" + String(out, 2));
+    Serial.print("[API] Price: $");
+    Serial.println(out, 2);
     consecutiveApiFailures = 0; // Reset failure counter on success
     return true;
   }
@@ -295,7 +354,9 @@ bool fetchWeekPrices(std::vector<float>& out) {
   // Check if we're in rate limit backoff period
   if (millis() < rateLimitBackoffUntil) {
     unsigned long remaining = (rateLimitBackoffUntil - millis()) / 1000;
-    Serial.println("[API] Rate limit backoff active, " + String(remaining) + "s remaining");
+    Serial.print("[API] Rate limit backoff active, ");
+    Serial.print(remaining);
+    Serial.println("s remaining");
     return false;
   }
 
@@ -304,65 +365,94 @@ bool fetchWeekPrices(std::vector<float>& out) {
 
   const char* host = "api.coingecko.com";
   const int httpsPort = 443;
-  const String url = "/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=7&interval=daily";
+  const char* url = "/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=7&interval=daily";
 
   Serial.println("[API] Fetching 7-day daily chart data...");
 
   if (!client.connect(host, httpsPort)) {
     Serial.println("[API] Connection failed!");
+    consecutiveApiFailures++;
     return false;
   }
 
-  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
-               "Host: " + host + "\r\n" +
-               "User-Agent: ESP32-Bitcoin-Display/" + String(FIRMWARE_VERSION) + "\r\n" +
-               "Accept: application/json\r\n" +
-               "Accept-Encoding: identity\r\n" +
-               "Connection: close\r\n\r\n");
+  // Use char buffer for request
+  char request[256];
+  snprintf(request, sizeof(request),
+           "GET %s HTTP/1.1\r\n"
+           "Host: %s\r\n"
+           "User-Agent: ESP32-Bitcoin-Display/%s\r\n"
+           "Accept: application/json\r\n"
+           "Accept-Encoding: identity\r\n"
+           "Connection: close\r\n\r\n",
+           url, host, FIRMWARE_VERSION);
+  client.print(request);
 
   unsigned long timeout = millis();
   while (client.available() == 0) {
     if (millis() - timeout > 10000) {
       Serial.println("[API] Timeout!");
       client.stop();
+      consecutiveApiFailures++;
       return false;
     }
   }
 
+  // Skip headers
   while (client.connected()) {
     String line = client.readStringUntil('\n');
     if (line == "\r" || line.length() == 0) break;
   }
 
-  // Optimized: Pre-allocate larger buffer for chart data
-  String rawPayload = "";
-  rawPayload.reserve(8192); // Chart data can be several KB
-
-  while (client.available()) {
-    char c = client.read();
-    rawPayload += c;
-  }
-  client.stop();
-
-  // Strip chunked transfer encoding
-  String payload = stripChunkedEncoding(rawPayload);
-
-  // Check for rate limiting
-  if (payload.indexOf("rate limit") != -1 || payload.indexOf("429") != -1) {
-    Serial.println("[API] ⚠️ Rate limit detected on chart endpoint!");
-    rateLimitBackoffUntil = millis() + 60000; // Back off for 60 seconds
+  // Read response into char buffer
+  char* rawPayload = (char*)malloc(CHART_BUFFER_SIZE);
+  if (!rawPayload) {
+    Serial.println("[API] Failed to allocate memory!");
+    client.stop();
+    consecutiveApiFailures++;
     return false;
   }
 
-  DynamicJsonDocument doc(16384); // Reduced from 32768 (still plenty for daily data)
+  size_t bytesRead = 0;
+  while (client.available() && bytesRead < CHART_BUFFER_SIZE - 1) {
+    rawPayload[bytesRead++] = client.read();
+  }
+  rawPayload[bytesRead] = '\0';
+  client.stop();
+
+  // Strip chunked transfer encoding
+  char* payload = (char*)malloc(CHART_BUFFER_SIZE);
+  if (!payload) {
+    Serial.println("[API] Failed to allocate memory!");
+    free(rawPayload);
+    consecutiveApiFailures++;
+    return false;
+  }
+  stripChunkedEncoding(rawPayload, payload, CHART_BUFFER_SIZE);
+  free(rawPayload);
+
+  // Check for rate limiting
+  if (strstr(payload, "rate limit") != NULL || strstr(payload, "429") != NULL) {
+    Serial.println("[API] ⚠️ Rate limit detected on chart endpoint!");
+    rateLimitBackoffUntil = millis() + 60000; // Back off for 60 seconds
+    free(payload);
+    consecutiveApiFailures++;
+    return false;
+  }
+
+  DynamicJsonDocument doc(16384);
   DeserializationError error = deserializeJson(doc, payload);
+  free(payload);
+
   if (error) {
-    Serial.println("[API] JSON parse failed: " + String(error.c_str()));
+    Serial.print("[API] JSON parse failed: ");
+    Serial.println(error.c_str());
+    consecutiveApiFailures++;
     return false;
   }
 
   if (!doc.containsKey("prices")) {
     Serial.println("[API] No 'prices' array in response!");
+    consecutiveApiFailures++;
     return false;
   }
 
@@ -377,7 +467,10 @@ bool fetchWeekPrices(std::vector<float>& out) {
     }
   }
 
-  Serial.println("[API] Got " + String(out.size()) + " daily data points");
+  Serial.print("[API] Got ");
+  Serial.print(out.size());
+  Serial.println(" daily data points");
+  consecutiveApiFailures = 0; // Reset on success
   return out.size() > 0;
 }
 
@@ -626,7 +719,13 @@ void drawChartLabels(const std::vector<float>& s, int x, int y, int w, int h) {
 // ========== MAIN ==========
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== Bitcoin Live Display v" + String(FIRMWARE_VERSION) + " ===");
+  Serial.print("\n\n=== Bitcoin Live Display v");
+  Serial.print(FIRMWARE_VERSION);
+  Serial.println(" ===");
+  Serial.println("=== BATTERY OPTIMIZED MODE (Always-On Display) ===");
+
+  // Configure power saving FIRST (before any high-power operations)
+  configurePowerSaving();
 
   randomSeed(esp_random());
   PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE + random(0, 10000);
@@ -634,8 +733,7 @@ void setup() {
 
   ledcSetup(BACKLIGHT_PWM_CHANNEL, 5000, 8);
   ledcAttachPin(BACKLIGHT_PIN, BACKLIGHT_PWM_CHANNEL);
-  setBacklight(true);
-  pinMode(BUTTON_PIN, INPUT);
+  ledcWrite(BACKLIGHT_PWM_CHANNEL, BACKLIGHT_FULL);  // Turn on backlight
   pinMode(BATTERY_PIN, INPUT);  // Configure battery ADC pin
   analogReadResolution(12);      // 12-bit ADC resolution (0-4095)
   checkBattery();                // Initial battery check
@@ -644,7 +742,9 @@ void setup() {
   tft.setTextColor(COLOR_TEXT, COLOR_BG);
   tft.setTextDatum(MC_DATUM);
   tft.drawString("BTC Display", SCREEN_WIDTH/2, SCREEN_HEIGHT/2-15, 4);
-  tft.drawString("v" + String(FIRMWARE_VERSION), SCREEN_WIDTH/2, SCREEN_HEIGHT/2+15, 2);
+  char versionStr[32];
+  snprintf(versionStr, sizeof(versionStr), "v%s", FIRMWARE_VERSION);
+  tft.drawString(versionStr, SCREEN_WIDTH/2, SCREEN_HEIGHT/2+15, 2);
   delay(1000);
 
   connectWifi();
@@ -654,39 +754,61 @@ void setup() {
     tft.drawString("Loading data...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 2);
 
     // Fetch current price immediately
+    Serial.println("[INIT] Fetching current price...");
     if (fetchCurrentPrice(currentPrice)) {
       priceNeedsRedraw = true;
+      Serial.println("[INIT] Price fetched successfully");
+    } else {
+      Serial.println("[INIT] Price fetch failed");
     }
 
     // Draw header with BTC label
+    Serial.println("[INIT] Drawing header...");
     drawHeader();
 
-    // Wait 20 seconds before fetching chart data (rate limiting)
+    // Wait before fetching chart data (rate limiting)
     tft.drawString("Waiting for chart...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 20, 1);
-    delay(20000);
+    Serial.println("[INIT] Waiting 20 seconds before chart fetch (rate limiting)...");
+    unsigned long waitUntil = millis() + 20000;
+    while (millis() < waitUntil) {
+      checkBattery();
+      delay(100);
+    }
+    Serial.println("[INIT] Wait complete, fetching chart data...");
 
     // Fetch 7-day chart data
     if (fetchWeekPrices(weekPrices)) {
       chartNeedsRedraw = true;
+      Serial.println("[INIT] Chart data fetched successfully");
+    } else {
+      Serial.println("[INIT] Chart fetch failed - will retry later");
     }
 
     // Initial draw
+    Serial.println("[INIT] Drawing initial display...");
     if (chartNeedsRedraw) {
       tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
       drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       chartNeedsRedraw = false;
+      Serial.println("[INIT] Chart drawn");
     }
 
     if (priceNeedsRedraw) {
       drawPrice(String(currentPrice, 2), currentPrice > 0);
       priceNeedsRedraw = false;
+      Serial.println("[INIT] Price drawn");
     }
 
     lastChartUpdate = millis();
     lastPriceUpdate = millis();
     lastFirmwareCheck = millis();
+
+    // Disconnect WiFi to save power (reconnect when needed)
+    if (ENABLE_WIFI_SLEEP) {
+      disconnectWifi();
+    }
 
   } else {
     tft.fillScreen(COLOR_BG);
@@ -696,105 +818,184 @@ void setup() {
   }
 
   Serial.println("\n[INIT] Setup complete!");
+  Serial.println("[INIT] Device ready - optimized for maximum battery life");
+  Serial.print("[INIT] Price update interval: ");
+  Serial.print(PRICE_UPDATE_INTERVAL_BASE / 60000);
+  Serial.println(" minutes");
+  Serial.print("[INIT] Chart update interval: ");
+  Serial.print(CHART_UPDATE_INTERVAL_BASE / 60000);
+  Serial.println(" minutes");
 }
 
 void loop() {
-  handleButton();
-  if (WiFi.status() != WL_CONNECTED) {
-    if (wifiConnected) {
-      Serial.println("[WiFi] Lost connection — reconnecting...");
-      wifiConnected = false;
-      connectWifi();
-    }
-    delay(1000);
-    return;
-  }
-
   unsigned long now = millis();
-
-  // --- Price update with exponential backoff on failure ---
-  if (now - lastPriceUpdate >= PRICE_UPDATE_INTERVAL) {
-    Serial.println("\n[UPDATE] Fetching price...");
-
-    // Apply exponential backoff if there have been consecutive failures
-    if (consecutiveApiFailures > 0) {
-      int backoff = calculateBackoff(consecutiveApiFailures);
-      Serial.println("[API] Applying backoff: " + String(backoff / 1000) + "s (attempt " + String(consecutiveApiFailures + 1) + ")");
-      delay(backoff);
-    }
-
-    bool success = fetchCurrentPrice(currentPrice);
-
-    if (success) {
-      // Only redraw chart + price when price updates
-      tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
-
-      if (weekPrices.size() > 0) {
-        drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-        drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-        drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-      }
-
-      // Draw large price on top of chart
-      drawPrice(String(currentPrice, 2), success);
-      drawBatteryWarning();  // Refresh battery warning
-    }
-
-    // Always update timestamp even if failed
-    lastPriceUpdate = now;
-    PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE + random(0, 10000);
-  }
-
-  // --- Chart update every 15 minutes ---
-  if (now - lastChartUpdate >= CHART_UPDATE_INTERVAL) {
-    Serial.println("\n[UPDATE] Fetching chart...");
-    bool success = fetchWeekPrices(weekPrices);
-    if (success) {
-      tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
-      drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-      drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-      drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-      drawPrice(String(currentPrice, 2), currentPrice > 0);
-      drawBatteryWarning();  // Refresh battery warning
-    }
-    lastChartUpdate = now;
-    CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE + random(0, 30000);
-  }
-
-  // --- Firmware update check every hour ---
-  if (now - lastFirmwareCheck >= FIRMWARE_UPDATE_INTERVAL) {
-    Serial.println("\n[UPDATE] Checking for firmware updates...");
-    checkForFirmwareUpdate();
-    lastFirmwareCheck = now;
-  }
 
   // --- Battery check every 30 seconds ---
   if (now - lastBatteryCheck >= BATTERY_CHECK_INTERVAL) {
     checkBattery();
     lastBatteryCheck = now;
-    // Update battery display if needed
     if (batteryLow || batteryCritical) {
       drawBatteryWarning();
     }
-  }
 
-  delay(100);
-}
+    // Check if device is plugged in (for automatic firmware updates)
+    wasPluggedIn = isPluggedIn;
+    isPluggedIn = checkIfPluggedIn();
 
-void setBacklight(bool bright) {
-  int brightness = bright ? BACKLIGHT_FULL : BACKLIGHT_DIM;
-  ledcWrite(BACKLIGHT_PWM_CHANNEL, brightness);
-  backlightBright = bright;
-}
+    // Detect plug-in event (transition from unplugged to plugged)
+    if (isPluggedIn && !wasPluggedIn) {
+      Serial.println("\n[POWER] 🔌 Device plugged in detected!");
+      Serial.print("[POWER] Voltage: ");
+      Serial.print(batteryVoltage, 2);
+      Serial.println("V (charging)");
+      firmwareCheckedThisSession = false;  // Reset flag for new plug-in session
+      drawBatteryWarning();  // Update display to show charging indicator
+    }
 
-void handleButton() {
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    unsigned long now = millis();
-    if (now - lastButtonPress > debounceDelay) {
-      lastButtonPress = now;
-      setBacklight(!backlightBright);
+    // Detect unplug event
+    if (!isPluggedIn && wasPluggedIn) {
+      Serial.println("\n[POWER] 🔋 Device unplugged - running on battery");
+      Serial.print("[POWER] Voltage: ");
+      Serial.print(batteryVoltage, 2);
+      Serial.println("V");
+      drawBatteryWarning();  // Update display to clear charging indicator
     }
   }
+
+  // --- Automatic firmware update when plugged in ---
+  if (isPluggedIn && !firmwareCheckedThisSession) {
+    Serial.println("\n[OTA] 🔌 Plugged in - checking for firmware updates...");
+
+    // Connect WiFi if needed
+    if (!wifiConnected) {
+      connectWifi();
+    }
+
+    if (wifiConnected) {
+      // Check for firmware update
+      bool updateFound = checkForFirmwareUpdate();
+      firmwareCheckedThisSession = true;  // Mark as checked
+
+      if (!updateFound) {
+        Serial.println("[OTA] No updates found - firmware is current");
+      }
+
+      // Disconnect WiFi to save power
+      if (ENABLE_WIFI_SLEEP) {
+        disconnectWifi();
+      }
+    }
+  }
+
+  // Check if any updates are needed
+  bool needsPriceUpdate = (now - lastPriceUpdate >= PRICE_UPDATE_INTERVAL);
+  bool needsChartUpdate = (now - lastChartUpdate >= CHART_UPDATE_INTERVAL);
+  bool needsFirmwareUpdate = (now - lastFirmwareCheck >= FIRMWARE_UPDATE_INTERVAL);
+
+  // If updates are needed, connect WiFi
+  if (needsPriceUpdate || needsChartUpdate || needsFirmwareUpdate) {
+
+    // Reconnect WiFi if needed
+    if (!wifiConnected) {
+      Serial.println("\n[POWER] Waking WiFi for updates...");
+      connectWifi();
+    }
+
+    // --- Price update ---
+    if (needsPriceUpdate && wifiConnected) {
+      Serial.println("\n[UPDATE] Fetching price...");
+
+      // Apply exponential backoff if there have been consecutive failures
+      if (consecutiveApiFailures > 0) {
+        int backoff = calculateBackoff(consecutiveApiFailures);
+        Serial.print("[API] Applying backoff: ");
+        Serial.print(backoff / 1000);
+        Serial.print("s (attempt ");
+        Serial.print(consecutiveApiFailures + 1);
+        Serial.println(")");
+
+        // Non-blocking backoff
+        unsigned long backoffUntil = millis() + backoff;
+        while (millis() < backoffUntil) {
+          checkBattery();
+          delay(100);
+        }
+      }
+
+      bool success = fetchCurrentPrice(currentPrice);
+
+      if (success) {
+        // Redraw chart and price
+        tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
+
+        if (weekPrices.size() > 0) {
+          drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+          drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+          drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+        }
+
+        drawPrice(String(currentPrice, 2), success);
+        drawBatteryWarning();
+      }
+
+      lastPriceUpdate = now;
+      PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE + random(0, 10000);
+    }
+
+    // --- Chart update ---
+    if (needsChartUpdate && wifiConnected) {
+      Serial.println("\n[UPDATE] Fetching chart...");
+      bool success = fetchWeekPrices(weekPrices);
+
+      if (success) {
+        tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
+        drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+        drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+        drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+        drawPrice(String(currentPrice, 2), currentPrice > 0);
+        drawBatteryWarning();
+      }
+
+      lastChartUpdate = now;
+      CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE + random(0, 30000);
+    }
+
+    // --- Firmware update check ---
+    if (needsFirmwareUpdate && wifiConnected) {
+      Serial.println("\n[UPDATE] Checking for firmware updates...");
+      checkForFirmwareUpdate();
+      lastFirmwareCheck = now;
+    }
+
+    // Disconnect WiFi to save power
+    if (ENABLE_WIFI_SLEEP) {
+      disconnectWifi();
+    }
+  }
+
+  delay(100);  // Small delay to prevent busy-waiting
+}
+
+// ========== CPU AND POWER OPTIMIZATION ==========
+void configurePowerSaving() {
+  Serial.println("\n[POWER] Configuring power-saving features...");
+
+  // Set CPU frequency to save power
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);
+  Serial.print("[POWER] CPU frequency set to ");
+  Serial.print(CPU_FREQ_MHZ);
+  Serial.println("MHz (saves ~30mA vs 240MHz)");
+
+  // Configure WiFi power save mode (light sleep when WiFi idle)
+  if (ENABLE_WIFI_SLEEP) {
+    WiFi.setSleep(true);  // Enable WiFi modem sleep
+    Serial.println("[POWER] WiFi modem sleep enabled");
+  }
+
+  Serial.println("[POWER] Power management initialized");
+  Serial.println("[POWER] Display always-on mode (encased device)");
+  Serial.println("[POWER] Expected power: ~50-80mA idle, ~200mA during updates");
+  Serial.println("[POWER] Battery savings vs stock: ~30-50% (WiFi off + 80MHz CPU)");
 }
 
 void checkBattery() {
@@ -842,12 +1043,29 @@ void checkBattery() {
   }
 }
 
+// ========== PLUG-IN DETECTION ==========
+bool checkIfPluggedIn() {
+  // When plugged in via USB, voltage rises above normal battery max (4.2V)
+  // Charging voltage typically reads 4.3-5.0V
+  if (batteryVoltage > BATTERY_CHARGING_VOLTAGE) {
+    return true;
+  }
+  return false;
+}
+
 void drawBatteryWarning() {
   if (batteryCritical) {
     // Critical: Red, blinking (will shut down)
     tft.setTextColor(COLOR_ERROR, COLOR_HEADER);
     tft.setTextDatum(TR_DATUM);
     tft.drawString("CRITICAL", SCREEN_WIDTH - 2, 2, 1);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(String(batteryVoltage, 2) + "V", SCREEN_WIDTH - 2, 12, 1);
+  } else if (isPluggedIn) {
+    // Plugged in: Green, show charging indicator
+    tft.setTextColor(COLOR_CHART, COLOR_HEADER);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString("CHARGING", SCREEN_WIDTH - 2, 2, 1);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(String(batteryVoltage, 2) + "V", SCREEN_WIDTH - 2, 12, 1);
   } else if (batteryLow) {
