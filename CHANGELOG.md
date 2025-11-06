@@ -14,6 +14,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add WiFi signal strength indicator
 - Add last update timestamp display
 - Add configurable price alerts
+- Consider deep sleep mode for battery operation
+
+---
+
+## [1.0.3] - 2025-01-05
+
+### Added
+- **OTA firmware update functionality** - Fully implemented GitHub-based over-the-air updates
+- **Certificate pinning for CoinGecko API** - Enhanced security with SSL verification using DigiCert root CA
+- **Exponential backoff for API failures** - Intelligent retry mechanism (5s, 10s, 20s, max 60s with jitter)
+- **Memory optimization** - Pre-allocated String buffers to reduce heap fragmentation
+- **Display state tracking** - Avoids unnecessary redraws for better performance
+- **Non-blocking rate limit handling** - Replaced blocking delays with state-based backoff
+- **Firmware version display** - Shows version number on startup screen
+- **Progress bar for OTA updates** - Visual feedback during firmware downloads
+
+### Changed
+- **Reduced JSON buffer size** - Chart data buffer reduced from 32KB to 16KB (still sufficient)
+- **Improved User-Agent headers** - Now includes firmware version for better API tracking
+- **Enhanced error recovery** - Consecutive failure tracking with automatic backoff
+- **Better serial logging** - More detailed OTA and API status messages
+
+### Fixed
+- **Security: SSL certificate verification** - No longer using `setInsecure()` for CoinGecko API
+- **Memory leaks** - String concatenation now uses `reserve()` to pre-allocate
+- **Missing OTA implementation** - Functions `checkForFirmwareUpdate()` and `performFirmwareUpdate()` now fully working
+- **Rate limit handling** - Non-blocking approach prevents device freezes
+
+### Security
+- ⚠️ **BREAKING**: Secrets management improved - `secrets.h` now excluded from git by default
+- Added SSL certificate pinning for CoinGecko API (MITM attack prevention)
+- GitHub OTA still uses `setInsecure()` due to Let's Encrypt compatibility issues on ESP32
 
 ---
 

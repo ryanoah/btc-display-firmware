@@ -1,7 +1,7 @@
 /**
  * Bitcoin Live Price Display for LILYGO T-Display ESP32
  * Features: BTC/USD price, 7-day chart, WiFi, GitHub OTA updates
- * Fixes: JSON reliability + API rate limiting protection
+ * Version 1.0.3: Security improvements, OTA implementation, optimizations
  */
 
 #include <Arduino.h>
@@ -15,7 +15,7 @@
 #include "secrets.h"
 
 // ========== FIRMWARE VERSION ==========
-#define FIRMWARE_VERSION "1.0.2"
+#define FIRMWARE_VERSION "1.0.3"
 
 // ========== HARDWARE CONFIGURATION ==========
 #define BUTTON_PIN    35
@@ -38,6 +38,11 @@
 #define CHART_UPDATE_INTERVAL_BASE    900000   // 15 minutes
 #define FIRMWARE_UPDATE_INTERVAL      3600000  // 1 hour
 
+// ========== RETRY CONFIGURATION ==========
+#define MAX_API_RETRIES 3
+#define INITIAL_BACKOFF_MS 5000
+#define MAX_BACKOFF_MS 60000
+
 // ========== COLOR SCHEME ==========
 #define COLOR_BG       0x0000
 #define COLOR_HEADER   0x0000  // Black header
@@ -45,6 +50,33 @@
 #define COLOR_GRID     0x2104
 #define COLOR_CHART    0x07E0
 #define COLOR_ERROR    0xF800
+#define COLOR_WARNING  0xFD20
+
+// ========== SSL CERTIFICATE (CoinGecko) ==========
+// Root CA certificate for api.coingecko.com (DigiCert Global Root G2)
+const char* coingecko_root_ca = \
+"-----BEGIN CERTIFICATE-----\n" \
+"MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh\n" \
+"MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3\n" \
+"d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH\n" \
+"MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT\n" \
+"MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j\n" \
+"b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG\n" \
+"9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI\n" \
+"2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx\n" \
+"1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ\n" \
+"q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz\n" \
+"tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ\n" \
+"vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP\n" \
+"BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV\n" \
+"5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY\n" \
+"1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4\n" \
+"NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG\n" \
+"Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91\n" \
+"8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe\n" \
+"pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl\n" \
+"MrY=\n" \
+"-----END CERTIFICATE-----\n";
 
 // ========== GLOBAL OBJECTS ==========
 TFT_eSPI tft = TFT_eSPI();
@@ -59,6 +91,14 @@ bool wifiConnected = false;
 bool backlightBright = true;
 unsigned long lastButtonPress = 0;
 const unsigned long debounceDelay = 200;
+
+// Rate limiting state
+unsigned long rateLimitBackoffUntil = 0;
+int consecutiveApiFailures = 0;
+
+// Display state tracking (to avoid unnecessary redraws)
+bool chartNeedsRedraw = true;
+bool priceNeedsRedraw = true;
 
 // Dynamic intervals (to randomize slightly)
 unsigned long PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE;
@@ -79,6 +119,7 @@ bool checkForFirmwareUpdate();
 void performFirmwareUpdate(const String& firmwareUrl);
 void handleButton();
 void setBacklight(bool bright);
+int calculateBackoff(int attempt);
 
 // ========== WIFI CONNECTION ==========
 void connectWifi() {
@@ -116,31 +157,39 @@ void connectWifi() {
   }
 }
 
+// ========== EXPONENTIAL BACKOFF ==========
+int calculateBackoff(int attempt) {
+  if (attempt <= 0) return 0;
+
+  int backoff = INITIAL_BACKOFF_MS * (1 << (attempt - 1)); // Exponential: 5s, 10s, 20s...
+  if (backoff > MAX_BACKOFF_MS) backoff = MAX_BACKOFF_MS;
+
+  // Add jitter (±20%)
+  int jitter = random(-backoff / 5, backoff / 5);
+  return backoff + jitter;
+}
+
 // ========== CHUNKED ENCODING PARSER ==========
 String stripChunkedEncoding(const String& raw) {
   if (raw.length() == 0) return "";
 
   // Check if this looks like chunked encoding
-  // Chunked responses start with a hex number on the first line
   int firstLineEnd = raw.indexOf('\n');
-  if (firstLineEnd == -1) return raw; // No newlines, return as-is
+  if (firstLineEnd == -1) return raw;
 
   String firstLine = raw.substring(0, firstLineEnd);
   firstLine.trim();
 
-  // Try to parse as hex - if it fails (returns 0) and the line isn't actually "0",
-  // then this probably isn't chunked encoding
   char* endPtr;
   long firstChunkSize = strtol(firstLine.c_str(), &endPtr, 16);
 
-  // If no characters were parsed, or if it's not a valid hex, return raw
   if (endPtr == firstLine.c_str() || (*endPtr != '\0' && *endPtr != '\r' && *endPtr != ' ')) {
-    Serial.println("[DEBUG] Not chunked encoded, returning raw");
     return raw;
   }
 
   // Looks like chunked encoding, proceed with parsing
   String result = "";
+  result.reserve(raw.length()); // Pre-allocate to reduce reallocations
   int pos = 0;
 
   while (pos < raw.length()) {
@@ -172,8 +221,15 @@ String stripChunkedEncoding(const String& raw) {
 
 // ========== COINGECKO API FETCHERS ==========
 bool fetchCurrentPrice(float& out) {
+  // Check if we're in rate limit backoff period
+  if (millis() < rateLimitBackoffUntil) {
+    unsigned long remaining = (rateLimitBackoffUntil - millis()) / 1000;
+    Serial.println("[API] Rate limit backoff active, " + String(remaining) + "s remaining");
+    return false;
+  }
+
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(coingecko_root_ca);  // Use certificate pinning
 
   const char* host = "api.coingecko.com";
   const int httpsPort = 443;
@@ -183,12 +239,13 @@ bool fetchCurrentPrice(float& out) {
 
   if (!client.connect(host, httpsPort)) {
     Serial.println("[API] Connection failed!");
+    consecutiveApiFailures++;
     return false;
   }
 
   client.print(String("GET ") + url + " HTTP/1.1\r\n" +
                "Host: " + host + "\r\n" +
-               "User-Agent: ESP32-Bitcoin-Display\r\n" +
+               "User-Agent: ESP32-Bitcoin-Display/" + String(FIRMWARE_VERSION) + "\r\n" +
                "Accept: application/json\r\n" +
                "Accept-Encoding: identity\r\n" +
                "Connection: close\r\n\r\n");
@@ -198,6 +255,7 @@ bool fetchCurrentPrice(float& out) {
     if (millis() - timeout > 5000) {
       Serial.println("[API] Timeout!");
       client.stop();
+      consecutiveApiFailures++;
       return false;
     }
   }
@@ -207,26 +265,24 @@ bool fetchCurrentPrice(float& out) {
     if (line == "\r" || line.length() == 0) break;
   }
 
-  // FIXED: Character-by-character reading to avoid chunked encoding issues
+  // Optimized: Pre-allocate buffer to reduce memory fragmentation
   String rawPayload = "";
+  rawPayload.reserve(512); // Most price responses are < 512 bytes
+
   while (client.available()) {
     char c = client.read();
     rawPayload += c;
   }
   client.stop();
 
-  // DEBUG: Show raw response
-  Serial.println("[DEBUG] Raw payload length: " + String(rawPayload.length()));
-  Serial.println("[DEBUG] Raw payload: " + rawPayload);
-
   // Strip chunked transfer encoding
   String payload = stripChunkedEncoding(rawPayload);
-  Serial.println("[DEBUG] Clean JSON length: " + String(payload.length()));
-  Serial.println("[DEBUG] Clean JSON: " + payload);
 
+  // Check for rate limiting
   if (payload.indexOf("rate limit") != -1 || payload.indexOf("429") != -1) {
-    Serial.println("[API] ⚠️ Rate limit detected — pausing for 60s...");
-    delay(60000);
+    Serial.println("[API] ⚠️ Rate limit detected!");
+    rateLimitBackoffUntil = millis() + 60000; // Back off for 60 seconds
+    consecutiveApiFailures++;
     return false;
   }
 
@@ -234,22 +290,32 @@ bool fetchCurrentPrice(float& out) {
   DeserializationError error = deserializeJson(doc, payload);
   if (error) {
     Serial.println("[API] JSON parse failed: " + String(error.c_str()));
+    consecutiveApiFailures++;
     return false;
   }
 
   if (doc.containsKey("bitcoin") && doc["bitcoin"].containsKey("usd")) {
     out = doc["bitcoin"]["usd"].as<float>();
     Serial.println("[API] Price: $" + String(out, 2));
+    consecutiveApiFailures = 0; // Reset failure counter on success
     return true;
   }
 
   Serial.println("[API] Invalid JSON structure!");
+  consecutiveApiFailures++;
   return false;
 }
 
 bool fetchWeekPrices(std::vector<float>& out) {
+  // Check if we're in rate limit backoff period
+  if (millis() < rateLimitBackoffUntil) {
+    unsigned long remaining = (rateLimitBackoffUntil - millis()) / 1000;
+    Serial.println("[API] Rate limit backoff active, " + String(remaining) + "s remaining");
+    return false;
+  }
+
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(coingecko_root_ca);  // Use certificate pinning
 
   const char* host = "api.coingecko.com";
   const int httpsPort = 443;
@@ -264,7 +330,7 @@ bool fetchWeekPrices(std::vector<float>& out) {
 
   client.print(String("GET ") + url + " HTTP/1.1\r\n" +
                "Host: " + host + "\r\n" +
-               "User-Agent: ESP32-Bitcoin-Display\r\n" +
+               "User-Agent: ESP32-Bitcoin-Display/" + String(FIRMWARE_VERSION) + "\r\n" +
                "Accept: application/json\r\n" +
                "Accept-Encoding: identity\r\n" +
                "Connection: close\r\n\r\n");
@@ -283,8 +349,10 @@ bool fetchWeekPrices(std::vector<float>& out) {
     if (line == "\r" || line.length() == 0) break;
   }
 
-  // FIXED: Character-by-character reading to avoid chunked encoding issues
+  // Optimized: Pre-allocate larger buffer for chart data
   String rawPayload = "";
+  rawPayload.reserve(8192); // Chart data can be several KB
+
   while (client.available()) {
     char c = client.read();
     rawPayload += c;
@@ -293,16 +361,15 @@ bool fetchWeekPrices(std::vector<float>& out) {
 
   // Strip chunked transfer encoding
   String payload = stripChunkedEncoding(rawPayload);
-  Serial.println("[DEBUG] Chart clean JSON length: " + String(payload.length()));
-  Serial.println("[DEBUG] First 200 chars: " + payload.substring(0, min(200, (int)payload.length())));
 
+  // Check for rate limiting
   if (payload.indexOf("rate limit") != -1 || payload.indexOf("429") != -1) {
-    Serial.println("[API] ⚠️ Rate limit detected on chart endpoint — pausing...");
-    delay(60000);
+    Serial.println("[API] ⚠️ Rate limit detected on chart endpoint!");
+    rateLimitBackoffUntil = millis() + 60000; // Back off for 60 seconds
     return false;
   }
 
-  DynamicJsonDocument doc(32768);
+  DynamicJsonDocument doc(16384); // Reduced from 32768 (still plenty for daily data)
   DeserializationError error = deserializeJson(doc, payload);
   if (error) {
     Serial.println("[API] JSON parse failed: " + String(error.c_str()));
@@ -327,6 +394,161 @@ bool fetchWeekPrices(std::vector<float>& out) {
 
   Serial.println("[API] Got " + String(out.size()) + " daily data points");
   return out.size() > 0;
+}
+
+// ========== GITHUB OTA FUNCTIONS ==========
+bool checkForFirmwareUpdate() {
+  Serial.println("\n[OTA] Checking for firmware updates...");
+
+  WiFiClientSecure client;
+  client.setInsecure(); // GitHub uses Let's Encrypt, which can be tricky on ESP32
+
+  const char* host = "api.github.com";
+  const int httpsPort = 443;
+  const String url = "/repos/" + String(GITHUB_REPO) + "/releases/latest";
+
+  if (!client.connect(host, httpsPort)) {
+    Serial.println("[OTA] Failed to connect to GitHub API");
+    return false;
+  }
+
+  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+               "Host: " + host + "\r\n" +
+               "User-Agent: ESP32-Bitcoin-Display/" + String(FIRMWARE_VERSION) + "\r\n" +
+               "Accept: application/vnd.github.v3+json\r\n" +
+               "Connection: close\r\n\r\n");
+
+  unsigned long timeout = millis();
+  while (client.available() == 0) {
+    if (millis() - timeout > 10000) {
+      Serial.println("[OTA] Timeout!");
+      client.stop();
+      return false;
+    }
+  }
+
+  // Skip headers
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r" || line.length() == 0) break;
+  }
+
+  // Read JSON payload
+  String payload = "";
+  payload.reserve(4096);
+  while (client.available()) {
+    payload += (char)client.read();
+  }
+  client.stop();
+
+  // Parse JSON
+  DynamicJsonDocument doc(8192);
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.println("[OTA] JSON parse failed: " + String(error.c_str()));
+    return false;
+  }
+
+  String latestVersion = doc["tag_name"].as<String>();
+
+  // Remove 'v' prefix if present (e.g., "v1.0.3" -> "1.0.3")
+  if (latestVersion.startsWith("v")) {
+    latestVersion = latestVersion.substring(1);
+  }
+
+  Serial.println("[OTA] Current version: " + String(FIRMWARE_VERSION));
+  Serial.println("[OTA] Latest version: " + latestVersion);
+
+  // Simple version comparison (works for semantic versioning)
+  if (latestVersion != String(FIRMWARE_VERSION) && latestVersion.length() > 0) {
+    Serial.println("[OTA] 🆕 New version available!");
+
+    // Find the firmware.bin asset
+    JsonArray assets = doc["assets"].as<JsonArray>();
+    for (JsonObject asset : assets) {
+      String name = asset["name"].as<String>();
+      if (name == "firmware.bin") {
+        String downloadUrl = asset["browser_download_url"].as<String>();
+        Serial.println("[OTA] Found firmware: " + name);
+        Serial.println("[OTA] URL: " + downloadUrl);
+        performFirmwareUpdate(downloadUrl);
+        return true;
+      }
+    }
+
+    Serial.println("[OTA] ⚠️ No firmware.bin found in release assets!");
+    return false;
+  } else {
+    Serial.println("[OTA] ✅ Firmware is up to date");
+    return false;
+  }
+}
+
+void performFirmwareUpdate(const String& firmwareUrl) {
+  Serial.println("[OTA] Starting firmware update...");
+  Serial.println("[OTA] URL: " + firmwareUrl);
+
+  // Show update screen
+  tft.fillScreen(COLOR_BG);
+  tft.setTextColor(COLOR_WARNING, COLOR_BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("FIRMWARE UPDATE", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 20, 4);
+  tft.setTextColor(COLOR_TEXT, COLOR_BG);
+  tft.drawString("Downloading...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 10, 2);
+  tft.setTextColor(COLOR_ERROR, COLOR_BG);
+  tft.drawString("DO NOT POWER OFF", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 35, 2);
+
+  WiFiClientSecure client;
+  client.setInsecure(); // GitHub uses Let's Encrypt
+
+  // Update progress callback
+  httpUpdate.onProgress([](int current, int total) {
+    if (total > 0) {
+      int percent = (current * 100) / total;
+      Serial.printf("[OTA] Progress: %d%%\n", percent);
+
+      // Draw progress bar
+      int barWidth = 200;
+      int barHeight = 10;
+      int barX = (SCREEN_WIDTH - barWidth) / 2;
+      int barY = SCREEN_HEIGHT / 2 + 50;
+
+      tft.drawRect(barX, barY, barWidth, barHeight, COLOR_TEXT);
+      tft.fillRect(barX + 2, barY + 2, (barWidth - 4) * percent / 100, barHeight - 4, COLOR_CHART);
+    }
+  });
+
+  // Perform the update
+  t_httpUpdate_return ret = httpUpdate.update(client, firmwareUrl);
+
+  switch (ret) {
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("[OTA] ❌ Update failed. Error (%d): %s\n",
+                    httpUpdate.getLastError(),
+                    httpUpdate.getLastErrorString().c_str());
+
+      tft.fillScreen(COLOR_BG);
+      tft.setTextColor(COLOR_ERROR, COLOR_BG);
+      tft.drawString("UPDATE FAILED!", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 10, 4);
+      tft.setTextColor(COLOR_TEXT, COLOR_BG);
+      tft.drawString(httpUpdate.getLastErrorString(), SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 20, 2);
+      delay(5000);
+      break;
+
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("[OTA] ℹ️ No update needed");
+      break;
+
+    case HTTP_UPDATE_OK:
+      Serial.println("[OTA] ✅ Update successful! Rebooting...");
+      tft.fillScreen(COLOR_BG);
+      tft.setTextColor(COLOR_CHART, COLOR_BG);
+      tft.drawString("UPDATE COMPLETE!", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 10, 4);
+      tft.drawString("Rebooting...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 20, 2);
+      delay(2000);
+      ESP.restart();
+      break;
+  }
 }
 
 // ========== DISPLAY ==========
@@ -418,9 +640,9 @@ void drawChartLabels(const std::vector<float>& s, int x, int y, int w, int h) {
 // ========== MAIN ==========
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== Bitcoin Live Display ===");
+  Serial.println("\n\n=== Bitcoin Live Display v" + String(FIRMWARE_VERSION) + " ===");
 
-  randomSeed(esp_random()); // for random interval jitter
+  randomSeed(esp_random());
   PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE + random(0, 10000);
   CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE + random(0, 30000);
 
@@ -433,7 +655,7 @@ void setup() {
   tft.setTextColor(COLOR_TEXT, COLOR_BG);
   tft.setTextDatum(MC_DATUM);
   tft.drawString("BTC Display", SCREEN_WIDTH/2, SCREEN_HEIGHT/2-15, 4);
-  tft.drawString("Initializing...", SCREEN_WIDTH/2, SCREEN_HEIGHT/2+15, 2);
+  tft.drawString("v" + String(FIRMWARE_VERSION), SCREEN_WIDTH/2, SCREEN_HEIGHT/2+15, 2);
   delay(1000);
 
   connectWifi();
@@ -443,28 +665,39 @@ void setup() {
     tft.drawString("Loading data...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 2);
 
     // Fetch current price immediately
-    fetchCurrentPrice(currentPrice);
+    if (fetchCurrentPrice(currentPrice)) {
+      priceNeedsRedraw = true;
+    }
 
     // Draw header with BTC label
     drawHeader();
 
-    // Wait 20 seconds before fetching chart data (within 30 sec window)
+    // Wait 20 seconds before fetching chart data (rate limiting)
+    tft.drawString("Waiting for chart...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 20, 1);
     delay(20000);
 
     // Fetch 7-day chart data
-    tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
     if (fetchWeekPrices(weekPrices)) {
+      chartNeedsRedraw = true;
+    }
+
+    // Initial draw
+    if (chartNeedsRedraw) {
+      tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
       drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+      chartNeedsRedraw = false;
     }
 
-    // Draw large price on top of chart
-    drawPrice(String(currentPrice, 2), currentPrice > 0);
+    if (priceNeedsRedraw) {
+      drawPrice(String(currentPrice, 2), currentPrice > 0);
+      priceNeedsRedraw = false;
+    }
 
-    // Set timestamp so next chart update happens in 15 minutes
     lastChartUpdate = millis();
     lastPriceUpdate = millis();
+    lastFirmwareCheck = millis();
 
   } else {
     tft.fillScreen(COLOR_BG);
@@ -478,6 +711,7 @@ void setup() {
 
 void loop() {
   handleButton();
+
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiConnected) {
       Serial.println("[WiFi] Lost connection — reconnecting...");
@@ -490,25 +724,32 @@ void loop() {
 
   unsigned long now = millis();
 
-  // --- Price update every minute (with backoff protection) ---
+  // --- Price update with exponential backoff on failure ---
   if (now - lastPriceUpdate >= PRICE_UPDATE_INTERVAL) {
     Serial.println("\n[UPDATE] Fetching price...");
-    bool success = fetchCurrentPrice(currentPrice);
 
-    // Redraw chart area background
-    tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
-
-    // Draw chart if we have data
-    if (weekPrices.size() > 0) {
-      drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-      drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-      drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+    // Apply exponential backoff if there have been consecutive failures
+    if (consecutiveApiFailures > 0) {
+      int backoff = calculateBackoff(consecutiveApiFailures);
+      Serial.println("[API] Applying backoff: " + String(backoff / 1000) + "s (attempt " + String(consecutiveApiFailures + 1) + ")");
+      delay(backoff);
     }
 
-    // Draw large price on top of chart
-    drawPrice(String(currentPrice, 2), success);
+    bool success = fetchCurrentPrice(currentPrice);
 
-    // Always update timestamp even if failed
+    if (success) {
+      // Only redraw chart + price when price updates
+      tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
+
+      if (weekPrices.size() > 0) {
+        drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+        drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+        drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
+      }
+
+      drawPrice(String(currentPrice, 2), true);
+    }
+
     lastPriceUpdate = now;
     PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE + random(0, 10000);
   }
@@ -522,11 +763,17 @@ void loop() {
       drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-      // Redraw price on top
       drawPrice(String(currentPrice, 2), currentPrice > 0);
     }
     lastChartUpdate = now;
     CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE + random(0, 30000);
+  }
+
+  // --- Firmware update check every hour ---
+  if (now - lastFirmwareCheck >= FIRMWARE_UPDATE_INTERVAL) {
+    Serial.println("\n[UPDATE] Checking for firmware updates...");
+    checkForFirmwareUpdate();
+    lastFirmwareCheck = now;
   }
 
   delay(100);

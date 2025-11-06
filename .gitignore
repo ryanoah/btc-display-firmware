@@ -5,7 +5,7 @@
 .gcc-flags.json
 
 # Secrets (DO NOT commit WiFi passwords or GitHub tokens!)
-# include/secrets.h  # Uncomment this if you want to keep secrets private
+include/secrets.h
 
 # Build files
 *.bin

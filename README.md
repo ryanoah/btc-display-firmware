@@ -4,7 +4,8 @@ A Bitcoin price tracker for LILYGO T-Display ESP32 with automatic firmware updat
 
 ![ESP32 Bitcoin Display](https://img.shields.io/badge/ESP32-Bitcoin%20Display-blue)
 ![OTA Updates](https://img.shields.io/badge/OTA-GitHub-green)
-![Version](https://img.shields.io/badge/version-1.0.0-orange)
+![Version](https://img.shields.io/badge/version-1.0.3-orange)
+![Security](https://img.shields.io/badge/security-improved-brightgreen)
 
 ## Features
 
