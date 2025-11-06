@@ -122,6 +122,7 @@ bool checkForFirmwareUpdate();
 void performFirmwareUpdate(const String& firmwareUrl);
 void handleButton();
 void setBacklight(bool bright);
+int calculateBackoff(int attempt);
 void checkBattery();
 void drawBatteryWarning();
 
@@ -754,10 +755,12 @@ void loop() {
         drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       }
 
-    // Draw large price on top of chart
-    drawPrice(String(currentPrice, 2), success);
-    drawBatteryWarning();  // Refresh battery warning
+      // Draw large price on top of chart
+      drawPrice(String(currentPrice, 2), success);
+      drawBatteryWarning();  // Refresh battery warning
+    }
 
+    // Always update timestamp even if failed
     lastPriceUpdate = now;
     PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE + random(0, 10000);
   }
