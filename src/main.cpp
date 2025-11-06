@@ -20,9 +20,11 @@
 // ========== HARDWARE CONFIGURATION ==========
 #define BUTTON_PIN    35
 #define BACKLIGHT_PIN 4
+#define BATTERY_PIN   34  // ADC pin for battery voltage
 #define BACKLIGHT_PWM_CHANNEL 0
 #define BACKLIGHT_DIM  64
 #define BACKLIGHT_FULL 255
+#define BATTERY_LOW_VOLTAGE 3.3  // Low battery threshold (volts)
 
 // ========== DISPLAY CONFIGURATION ==========
 #define SCREEN_WIDTH  240
@@ -89,6 +91,7 @@ unsigned long lastChartUpdate = 0;
 unsigned long lastFirmwareCheck = 0;
 bool wifiConnected = false;
 bool backlightBright = true;
+bool batteryLow = false;
 unsigned long lastButtonPress = 0;
 const unsigned long debounceDelay = 200;
 
@@ -119,7 +122,8 @@ bool checkForFirmwareUpdate();
 void performFirmwareUpdate(const String& firmwareUrl);
 void handleButton();
 void setBacklight(bool bright);
-int calculateBackoff(int attempt);
+void checkBattery();
+void drawBatteryWarning();
 
 // ========== WIFI CONNECTION ==========
 void connectWifi() {
@@ -557,18 +561,19 @@ void drawHeader() {
   tft.setTextColor(COLOR_TEXT, COLOR_HEADER);
   tft.setTextDatum(MC_DATUM);
   tft.drawString("BTC", SCREEN_WIDTH / 2, HEADER_HEIGHT / 2, 2);
+  drawBatteryWarning();  // Draw battery warning if needed
 }
 
 void drawPrice(const String& price, bool netOk) {
-  // Draw price in center of screen (transparent, over the chart background)
+  // Draw price slightly below center (transparent, over the chart background)
   tft.setTextDatum(MC_DATUM);
 
   if (netOk && price.length() > 0) {
     tft.setTextColor(COLOR_TEXT);  // No background - transparent text
-    tft.drawString("$" + price, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 4);
+    tft.drawString("$" + price, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 8, 6);  // Moved down 8px, font size 6
   } else {
     tft.setTextColor(COLOR_ERROR);  // No background - transparent text
-    tft.drawString("NO DATA", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 4);
+    tft.drawString("NO DATA", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 8, 6);
   }
 }
 
@@ -650,6 +655,9 @@ void setup() {
   ledcAttachPin(BACKLIGHT_PIN, BACKLIGHT_PWM_CHANNEL);
   setBacklight(true);
   pinMode(BUTTON_PIN, INPUT);
+  pinMode(BATTERY_PIN, INPUT);  // Configure battery ADC pin
+  analogReadResolution(12);      // 12-bit ADC resolution (0-4095)
+  checkBattery();                // Initial battery check
 
   tft.init(); tft.setRotation(1); tft.fillScreen(COLOR_BG);
   tft.setTextColor(COLOR_TEXT, COLOR_BG);
@@ -711,7 +719,6 @@ void setup() {
 
 void loop() {
   handleButton();
-
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiConnected) {
       Serial.println("[WiFi] Lost connection — reconnecting...");
@@ -747,8 +754,9 @@ void loop() {
         drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       }
 
-      drawPrice(String(currentPrice, 2), true);
-    }
+    // Draw large price on top of chart
+    drawPrice(String(currentPrice, 2), success);
+    drawBatteryWarning();  // Refresh battery warning
 
     lastPriceUpdate = now;
     PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE + random(0, 10000);
@@ -764,6 +772,7 @@ void loop() {
       drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
       drawPrice(String(currentPrice, 2), currentPrice > 0);
+      drawBatteryWarning();  // Refresh battery warning
     }
     lastChartUpdate = now;
     CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE + random(0, 30000);
@@ -792,5 +801,30 @@ void handleButton() {
       lastButtonPress = now;
       setBacklight(!backlightBright);
     }
+  }
+}
+
+void checkBattery() {
+  // Read battery voltage from ADC
+  // LILYGO T-Display has voltage divider (2:1), ADC range 0-4095 for 0-3.3V
+  // Actual battery voltage = (ADC_value / 4095) * 3.3V * 2
+  int adcValue = analogRead(BATTERY_PIN);
+  float voltage = (adcValue / 4095.0) * 3.3 * 2.0;
+
+  batteryLow = (voltage < BATTERY_LOW_VOLTAGE && voltage > 0.5);  // Ignore very low readings (disconnected)
+
+  if (batteryLow) {
+    Serial.println("[BATTERY] Low voltage: " + String(voltage, 2) + "V");
+  }
+}
+
+void drawBatteryWarning() {
+  if (batteryLow) {
+    tft.setTextColor(COLOR_ERROR, COLOR_HEADER);
+    tft.setTextDatum(TR_DATUM);  // Top-right alignment
+    tft.drawString("CHARGE", SCREEN_WIDTH - 2, 2, 1);  // Small font, top-right corner
+  } else {
+    // Clear the warning area if battery is OK
+    tft.fillRect(SCREEN_WIDTH - 40, 0, 40, 12, COLOR_HEADER);
   }
 }
