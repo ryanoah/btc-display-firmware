@@ -1,7 +1,7 @@
 /**
  * Bitcoin Live Price Display for LILYGO T-Display ESP32
  * Features: BTC/USD price, 7-day chart, WiFi, GitHub OTA updates
- * Version 1.1.0: Battery optimizations, automatic firmware updates on plug-in
+ * Version 1.1.0: Real-time price updates (30s), automatic firmware updates on plug-in
  */
 
 #include <Arduino.h>
@@ -18,9 +18,8 @@
 #define FIRMWARE_VERSION "1.1.0"
 
 // ========== POWER MANAGEMENT ==========
-// Battery life is the TOP priority - optimized for minimal power consumption
 // NOTE: Device is encased without button access - display always on
-#define ENABLE_WIFI_SLEEP true         // Turn off WiFi between updates (saves ~80-170mA)
+// WiFi stays connected for real-time price updates
 #define CPU_FREQ_MHZ 80                // Run at 80MHz instead of 240MHz (saves ~30mA)
 
 // ========== HARDWARE CONFIGURATION ==========
@@ -42,8 +41,8 @@
 #define CHART_WIDTH   240
 #define CHART_HEIGHT  107  // Full screen minus header (135-28)
 
-// ========== UPDATE INTERVALS (optimized for battery life) ==========
-#define PRICE_UPDATE_INTERVAL_BASE    300000   // 5 minutes (was 60 seconds)
+// ========== UPDATE INTERVALS ==========
+#define PRICE_UPDATE_INTERVAL_BASE    30000    // 30 seconds
 #define CHART_UPDATE_INTERVAL_BASE    3600000  // 1 hour (was 15 minutes)
 #define FIRMWARE_UPDATE_INTERVAL      86400000 // 24 hours (was 1 hour)
 
@@ -100,7 +99,6 @@ unsigned long CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE;
 
 // ========== FUNCTION DECLARATIONS ==========
 void connectWifi();
-void disconnectWifi();
 void stripChunkedEncoding(const char* raw, char* output, size_t maxLen);
 bool fetchCurrentPrice(float& out);
 bool fetchWeekPrices(std::vector<float>& out);
@@ -153,17 +151,6 @@ void connectWifi() {
     tft.setTextColor(COLOR_ERROR, COLOR_BG);
     tft.drawString("WiFi Failed!", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 2);
     delay(2000);
-  }
-}
-
-// ========== WIFI DISCONNECTION (POWER SAVING) ==========
-void disconnectWifi() {
-  if (wifiConnected) {
-    Serial.println("[WiFi] Disconnecting to save power...");
-    WiFi.disconnect(true);  // true = turn off WiFi radio
-    WiFi.mode(WIFI_OFF);
-    wifiConnected = false;
-    Serial.println("[WiFi] Disconnected - saved ~80-170mA");
   }
 }
 
@@ -706,10 +693,10 @@ void performFirmwareUpdate(const String& firmwareUrl) {
 void drawHeader() {
   tft.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, COLOR_HEADER);
 
-  // Draw BTC label - larger and more prominent
+  // Draw BTC label - larger and centered
   tft.setTextColor(COLOR_TEXT, COLOR_HEADER);
-  tft.setTextDatum(ML_DATUM);  // Middle-left alignment
-  tft.drawString("BTC", 5, HEADER_HEIGHT / 2, 4);  // Font size 4, left-aligned with 5px padding
+  tft.setTextDatum(MC_DATUM);  // Middle-center alignment
+  tft.drawString("BTC", SCREEN_WIDTH / 2, HEADER_HEIGHT / 2, 4);  // Font size 4, centered
 
   drawBatteryWarning();  // Draw battery warning if needed
 }
@@ -720,7 +707,8 @@ void drawPrice(const String& price, bool netOk) {
 
   if (netOk && price.length() > 0) {
     tft.setTextColor(COLOR_TEXT);  // No background - transparent text
-    tft.drawString("$" + price, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 8, 6);  // Moved down 8px, font size 6
+    String displayPrice = "$" + price;  // Explicitly create price string with $ sign
+    tft.drawString(displayPrice, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 8, 6);  // Moved down 8px, font size 6
   } else {
     tft.setTextColor(COLOR_ERROR);  // No background - transparent text
     tft.drawString("NO DATA", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 8, 6);
@@ -881,11 +869,6 @@ void setup() {
     lastPriceUpdate = millis();
     lastFirmwareCheck = millis();
 
-    // Disconnect WiFi to save power (reconnect when needed)
-    if (ENABLE_WIFI_SLEEP) {
-      disconnectWifi();
-    }
-
   } else {
     tft.fillScreen(COLOR_BG);
     drawHeader();
@@ -894,10 +877,10 @@ void setup() {
   }
 
   Serial.println("\n[INIT] Setup complete!");
-  Serial.println("[INIT] Device ready - optimized for maximum battery life");
+  Serial.println("[INIT] Device ready - real-time price updates enabled");
   Serial.print("[INIT] Price update interval: ");
-  Serial.print(PRICE_UPDATE_INTERVAL_BASE / 60000);
-  Serial.println(" minutes");
+  Serial.print(PRICE_UPDATE_INTERVAL_BASE / 1000);
+  Serial.println(" seconds");
   Serial.print("[INIT] Chart update interval: ");
   Serial.print(CHART_UPDATE_INTERVAL_BASE / 60000);
   Serial.println(" minutes");
@@ -955,11 +938,6 @@ void loop() {
       if (!updateFound) {
         Serial.println("[OTA] No updates found - firmware is current");
       }
-
-      // Disconnect WiFi to save power
-      if (ENABLE_WIFI_SLEEP) {
-        disconnectWifi();
-      }
     }
   }
 
@@ -968,14 +946,8 @@ void loop() {
   bool needsChartUpdate = (now - lastChartUpdate >= CHART_UPDATE_INTERVAL);
   bool needsFirmwareUpdate = (now - lastFirmwareCheck >= FIRMWARE_UPDATE_INTERVAL);
 
-  // If updates are needed, connect WiFi
+  // Perform updates (WiFi stays connected)
   if (needsPriceUpdate || needsChartUpdate || needsFirmwareUpdate) {
-
-    // Reconnect WiFi if needed
-    if (!wifiConnected) {
-      Serial.println("\n[POWER] Waking WiFi for updates...");
-      connectWifi();
-    }
 
     // --- Price update ---
     if (needsPriceUpdate && wifiConnected) {
@@ -1042,11 +1014,6 @@ void loop() {
       checkForFirmwareUpdate();
       lastFirmwareCheck = now;
     }
-
-    // Disconnect WiFi to save power
-    if (ENABLE_WIFI_SLEEP) {
-      disconnectWifi();
-    }
   }
 
   delay(100);  // Small delay to prevent busy-waiting
@@ -1062,16 +1029,9 @@ void configurePowerSaving() {
   Serial.print(CPU_FREQ_MHZ);
   Serial.println("MHz (saves ~30mA vs 240MHz)");
 
-  // Configure WiFi power save mode (light sleep when WiFi idle)
-  if (ENABLE_WIFI_SLEEP) {
-    WiFi.setSleep(true);  // Enable WiFi modem sleep
-    Serial.println("[POWER] WiFi modem sleep enabled");
-  }
-
   Serial.println("[POWER] Power management initialized");
   Serial.println("[POWER] Display always-on mode (encased device)");
-  Serial.println("[POWER] Expected power: ~50-80mA idle, ~200mA during updates");
-  Serial.println("[POWER] Battery savings vs stock: ~30-50% (WiFi off + 80MHz CPU)");
+  Serial.println("[POWER] WiFi stays connected for real-time price updates");
 }
 
 void checkBattery() {
