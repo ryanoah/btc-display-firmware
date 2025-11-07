@@ -1,7 +1,7 @@
 /**
  * Bitcoin Live Price Display for LILYGO T-Display ESP32
- * Features: BTC/USD price, 7-day chart, WiFi, GitHub OTA updates
- * Version 1.1.0: Real-time price updates (30s), automatic firmware updates on plug-in
+ * Features: BTC/USD price display, WiFi, GitHub OTA updates
+ * Version 1.3.1: 6-hour price updates, 24-hour firmware checks, WiFi power cycling
  */
 
 #include <Arduino.h>
@@ -11,22 +11,21 @@
 #include <Update.h>
 #include <TFT_eSPI.h>
 #include <ArduinoJson.h>
-#include <vector>
 #include "secrets.h"
 
 // ========== FIRMWARE VERSION ==========
-#define FIRMWARE_VERSION "1.1.0"
+#define FIRMWARE_VERSION "1.3.1"
 
 // ========== POWER MANAGEMENT ==========
 // NOTE: Device is encased without button access - display always on
-// WiFi stays connected for real-time price updates
+// WiFi disconnects between updates to maximize battery life
 #define CPU_FREQ_MHZ 80                // Run at 80MHz instead of 240MHz (saves ~30mA)
 
 // ========== HARDWARE CONFIGURATION ==========
 #define BACKLIGHT_PIN 4
 #define BATTERY_PIN   34  // ADC pin for battery voltage
 #define BACKLIGHT_PWM_CHANNEL 0
-#define BACKLIGHT_FULL 128             // Brightness level (reduced for battery savings)
+#define BACKLIGHT_FULL 16              // Very low brightness for maximum battery savings (was 32)
 #define BATTERY_LOW_VOLTAGE 3.5       // Low battery warning threshold (volts)
 #define BATTERY_CRITICAL_VOLTAGE 3.0  // Critical - shutdown to prevent damage (volts)
 #define BATTERY_CHARGING_VOLTAGE 4.3  // Voltage indicating device is plugged in/charging
@@ -35,16 +34,10 @@
 // ========== DISPLAY CONFIGURATION ==========
 #define SCREEN_WIDTH  240
 #define SCREEN_HEIGHT 135
-#define HEADER_HEIGHT 28
-#define CHART_X       0
-#define CHART_Y       28
-#define CHART_WIDTH   240
-#define CHART_HEIGHT  107  // Full screen minus header (135-28)
 
 // ========== UPDATE INTERVALS ==========
-#define PRICE_UPDATE_INTERVAL_BASE    30000    // 30 seconds
-#define CHART_UPDATE_INTERVAL_BASE    3600000  // 1 hour (was 15 minutes)
-#define FIRMWARE_UPDATE_INTERVAL      86400000 // 24 hours (was 1 hour)
+#define PRICE_UPDATE_INTERVAL_BASE    21600000 // 6 hours
+#define FIRMWARE_UPDATE_INTERVAL      86400000 // 24 hours
 
 // ========== RETRY CONFIGURATION ==========
 #define MAX_API_RETRIES 3
@@ -53,8 +46,6 @@
 
 // ========== BUFFER SIZES ==========
 #define PRICE_BUFFER_SIZE 512
-#define CHART_BUFFER_SIZE 8192
-#define RESPONSE_BUFFER_SIZE 4096
 
 // ========== COLOR SCHEME ==========
 #define COLOR_BG       0x0000
@@ -70,9 +61,7 @@ TFT_eSPI tft = TFT_eSPI();
 
 // ========== STATE VARIABLES ==========
 float currentPrice = 0.0;
-std::vector<float> weekPrices;
 unsigned long lastPriceUpdate = 0;
-unsigned long lastChartUpdate = 0;
 unsigned long lastFirmwareCheck = 0;
 bool wifiConnected = false;
 bool batteryLow = false;
@@ -80,34 +69,24 @@ bool batteryCritical = false;
 float batteryVoltage = 0.0;
 unsigned long lastBatteryCheck = 0;
 
-// Plug-in detection and firmware update
+// Plug-in detection (for display only)
 bool isPluggedIn = false;
 bool wasPluggedIn = false;
-bool firmwareCheckedThisSession = false;  // Track if we've checked firmware while plugged in
 
 // Rate limiting state
 unsigned long rateLimitBackoffUntil = 0;
 int consecutiveApiFailures = 0;
 
-// Display state tracking (to avoid unnecessary redraws)
-bool chartNeedsRedraw = true;
-bool priceNeedsRedraw = true;
-
 // Dynamic intervals (to randomize slightly)
 unsigned long PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE;
-unsigned long CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE;
 
 // ========== FUNCTION DECLARATIONS ==========
 void connectWifi();
+void disconnectWifi();
 void stripChunkedEncoding(const char* raw, char* output, size_t maxLen);
 bool fetchCurrentPrice(float& out);
-bool fetchWeekPrices(std::vector<float>& out);
-void drawHeader();
-void drawPrice(const String& price, bool netOk = true);
-void drawGrid(int x, int y, int w, int h);
-void drawSeries(const std::vector<float>& s, int x, int y, int w, int h);
-void drawChartLabels(const std::vector<float>& s, int x, int y, int w, int h);
-String formatPrice(float price);
+void drawPrice(float price, bool netOk = true);
+String formatPriceWithCommas(float price);
 bool checkForFirmwareUpdate();
 void performFirmwareUpdate(const String& firmwareUrl);
 int calculateBackoff(int attempt);
@@ -151,6 +130,16 @@ void connectWifi() {
     tft.setTextColor(COLOR_ERROR, COLOR_BG);
     tft.drawString("WiFi Failed!", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 2);
     delay(2000);
+  }
+}
+
+void disconnectWifi() {
+  if (wifiConnected) {
+    Serial.println("[WiFi] Disconnecting to save power...");
+    WiFi.disconnect(true);  // true = turn off WiFi radio
+    WiFi.mode(WIFI_OFF);
+    wifiConnected = false;
+    Serial.println("[WiFi] Disconnected");
   }
 }
 
@@ -338,129 +327,6 @@ bool fetchCurrentPrice(float& out) {
   return false;
 }
 
-bool fetchWeekPrices(std::vector<float>& out) {
-  // Check if we're in rate limit backoff period
-  if (millis() < rateLimitBackoffUntil) {
-    unsigned long remaining = (rateLimitBackoffUntil - millis()) / 1000;
-    Serial.print("[API] Rate limit backoff active, ");
-    Serial.print(remaining);
-    Serial.println("s remaining");
-    return false;
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure();  // TODO: Fix certificate chain for CoinGecko
-
-  const char* host = "api.coingecko.com";
-  const int httpsPort = 443;
-  const char* url = "/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=7&interval=daily";
-
-  Serial.println("[API] Fetching 7-day daily chart data...");
-
-  if (!client.connect(host, httpsPort)) {
-    Serial.println("[API] Connection failed!");
-    consecutiveApiFailures++;
-    return false;
-  }
-
-  // Use char buffer for request
-  char request[256];
-  snprintf(request, sizeof(request),
-           "GET %s HTTP/1.1\r\n"
-           "Host: %s\r\n"
-           "User-Agent: ESP32-Bitcoin-Display/%s\r\n"
-           "Accept: application/json\r\n"
-           "Accept-Encoding: identity\r\n"
-           "Connection: close\r\n\r\n",
-           url, host, FIRMWARE_VERSION);
-  client.print(request);
-
-  unsigned long timeout = millis();
-  while (client.available() == 0) {
-    if (millis() - timeout > 10000) {
-      Serial.println("[API] Timeout!");
-      client.stop();
-      consecutiveApiFailures++;
-      return false;
-    }
-  }
-
-  // Skip headers
-  while (client.connected()) {
-    String line = client.readStringUntil('\n');
-    if (line == "\r" || line.length() == 0) break;
-  }
-
-  // Read response into char buffer
-  char* rawPayload = (char*)malloc(CHART_BUFFER_SIZE);
-  if (!rawPayload) {
-    Serial.println("[API] Failed to allocate memory!");
-    client.stop();
-    consecutiveApiFailures++;
-    return false;
-  }
-
-  size_t bytesRead = 0;
-  while (client.available() && bytesRead < CHART_BUFFER_SIZE - 1) {
-    rawPayload[bytesRead++] = client.read();
-  }
-  rawPayload[bytesRead] = '\0';
-  client.stop();
-
-  // Strip chunked transfer encoding
-  char* payload = (char*)malloc(CHART_BUFFER_SIZE);
-  if (!payload) {
-    Serial.println("[API] Failed to allocate memory!");
-    free(rawPayload);
-    consecutiveApiFailures++;
-    return false;
-  }
-  stripChunkedEncoding(rawPayload, payload, CHART_BUFFER_SIZE);
-  free(rawPayload);
-
-  // Check for rate limiting
-  if (strstr(payload, "rate limit") != NULL || strstr(payload, "429") != NULL) {
-    Serial.println("[API] ⚠️ Rate limit detected on chart endpoint!");
-    rateLimitBackoffUntil = millis() + 60000; // Back off for 60 seconds
-    free(payload);
-    consecutiveApiFailures++;
-    return false;
-  }
-
-  DynamicJsonDocument doc(16384);
-  DeserializationError error = deserializeJson(doc, payload);
-  free(payload);
-
-  if (error) {
-    Serial.print("[API] JSON parse failed: ");
-    Serial.println(error.c_str());
-    consecutiveApiFailures++;
-    return false;
-  }
-
-  if (!doc.containsKey("prices")) {
-    Serial.println("[API] No 'prices' array in response!");
-    consecutiveApiFailures++;
-    return false;
-  }
-
-  JsonArray prices = doc["prices"].as<JsonArray>();
-  out.clear();
-
-  // Get all daily data points
-  for (JsonArray pricePoint : prices) {
-    if (pricePoint.size() >= 2) {
-      float price = pricePoint[1].as<float>();
-      out.push_back(price);
-    }
-  }
-
-  Serial.print("[API] Got ");
-  Serial.print(out.size());
-  Serial.println(" daily data points");
-  consecutiveApiFailures = 0; // Reset on success
-  return out.size() > 0;
-}
 
 // ========== SEMANTIC VERSION COMPARISON ==========
 /**
@@ -690,94 +556,50 @@ void performFirmwareUpdate(const String& firmwareUrl) {
 }
 
 // ========== DISPLAY ==========
-void drawHeader() {
-  tft.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, COLOR_HEADER);
+String formatPriceWithCommas(float price) {
+  // Convert price to integer
+  int priceInt = (int)price;
 
-  // Draw BTC label - larger and centered
-  tft.setTextColor(COLOR_TEXT, COLOR_HEADER);
-  tft.setTextDatum(MC_DATUM);  // Middle-center alignment
-  tft.drawString("BTC", SCREEN_WIDTH / 2, HEADER_HEIGHT / 2, 4);  // Font size 4, centered
+  // Convert to string
+  String priceStr = String(priceInt);
+  String result = "";
 
-  drawBatteryWarning();  // Draw battery warning if needed
+  int len = priceStr.length();
+  for (int i = 0; i < len; i++) {
+    if (i > 0 && (len - i) % 3 == 0) {
+      result += ",";
+    }
+    result += priceStr.charAt(i);
+  }
+
+  return "$" + result;
 }
 
-void drawPrice(const String& price, bool netOk) {
-  // Draw price slightly below center (transparent, over the chart background)
-  tft.setTextDatum(MC_DATUM);
+void drawPrice(float price, bool netOk) {
+  // Clear screen
+  tft.fillScreen(COLOR_BG);
 
-  if (netOk && price.length() > 0) {
-    tft.setTextColor(COLOR_TEXT);  // No background - transparent text
-    String displayPrice = "$" + price;  // Explicitly create price string with $ sign
-    tft.drawString(displayPrice, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 8, 6);  // Moved down 8px, font size 6
+  if (netOk && price > 0) {
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+    String priceWithCommas = formatPriceWithCommas(price);
+
+    // Remove the $ from the formatted price
+    String priceNumbers = priceWithCommas.substring(1);  // Remove leading "$"
+
+    int centerY = SCREEN_HEIGHT / 2;
+
+    // Draw price numbers centered in font 6
+    tft.setTextDatum(MC_DATUM);  // Middle-center alignment
+    tft.drawString(priceNumbers, SCREEN_WIDTH / 2, centerY, 6);
+
   } else {
-    tft.setTextColor(COLOR_ERROR);  // No background - transparent text
-    tft.drawString("NO DATA", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 8, 6);
+    tft.setTextColor(COLOR_ERROR, COLOR_BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("NO DATA", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 4);
   }
-}
 
-void drawGrid(int x, int y, int w, int h) {
-  for (int i = 1; i < 4; i++) {
-    int yPos = y + (h * i / 4);
-    tft.drawLine(x, yPos, x + w - 1, yPos, COLOR_GRID);
-  }
-  for (int i = 1; i < 7; i++) {
-    int xPos = x + (w * i / 7);
-    tft.drawLine(xPos, y, xPos, y + h - 1, COLOR_GRID);
-  }
-}
-
-void drawSeries(const std::vector<float>& s, int x, int y, int w, int h) {
-  if (s.size() < 2) return;
-  float minPrice = s[0], maxPrice = s[0];
-  for (float p : s) { if (p < minPrice) minPrice = p; if (p > maxPrice) maxPrice = p; }
-  float range = maxPrice - minPrice; if (range < 1.0) range = 1.0;
-  minPrice -= range * 0.05; maxPrice += range * 0.05; range = maxPrice - minPrice;
-  for (size_t i = 1; i < s.size(); i++) {
-    int x1 = x + (w * (i - 1)) / (s.size() - 1);
-    int y1 = y + h - (int)((s[i - 1] - minPrice) / range * h);
-    int x2 = x + (w * i) / (s.size() - 1);
-    int y2 = y + h - (int)((s[i] - minPrice) / range * h);
-
-    // Color line based on price movement: green if up, red if down
-    uint16_t lineColor = (s[i] >= s[i - 1]) ? COLOR_CHART : COLOR_ERROR;
-    tft.drawLine(x1, y1, x2, y2, lineColor);
-  }
-}
-
-String formatPrice(float price) {
-  if (price >= 1000.0) {
-    int k = (int)(price / 1000.0);
-    return String(k) + "k";
-  }
-  return String((int)price);
-}
-
-void drawChartLabels(const std::vector<float>& s, int x, int y, int w, int h) {
-  if (s.size() < 2) return;
-
-  // Calculate min/max prices (same logic as drawSeries)
-  float minPrice = s[0], maxPrice = s[0];
-  for (float p : s) { if (p < minPrice) minPrice = p; if (p > maxPrice) maxPrice = p; }
-  float range = maxPrice - minPrice; if (range < 1.0) range = 1.0;
-  minPrice -= range * 0.05; maxPrice += range * 0.05;
-
-  // Draw price labels on the left side
-  tft.setTextColor(COLOR_GRID, COLOR_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextSize(1);
-
-  // Max price at top
-  tft.drawString(formatPrice(maxPrice), x + 2, y + 2, 1);
-
-  // Min price at bottom
-  tft.drawString(formatPrice(minPrice), x + 2, y + h - 10, 1);
-
-  // Day markers at bottom (1 data point per day for daily intervals)
-  tft.setTextDatum(TC_DATUM);
-  for (int day = 0; day < s.size() && day <= 7; day++) {
-    int xPos = x + (w * day) / (s.size() - 1);
-    tft.drawString(String(day), xPos, y + h - 9, 1);
-  }
+  // Draw battery warning if needed
+  drawBatteryWarning();
 }
 
 // ========== MAIN ==========
@@ -786,18 +608,17 @@ void setup() {
   Serial.print("\n\n=== Bitcoin Live Display v");
   Serial.print(FIRMWARE_VERSION);
   Serial.println(" ===");
-  Serial.println("=== BATTERY OPTIMIZED MODE (Always-On Display) ===");
+  Serial.println("=== BATTERY OPTIMIZED MODE (Low backlight + WiFi power cycling) ===");
 
   // Configure power saving FIRST (before any high-power operations)
   configurePowerSaving();
 
   randomSeed(esp_random());
   PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE + random(0, 10000);
-  CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE + random(0, 30000);
 
   ledcSetup(BACKLIGHT_PWM_CHANNEL, 5000, 8);
   ledcAttachPin(BACKLIGHT_PIN, BACKLIGHT_PWM_CHANNEL);
-  ledcWrite(BACKLIGHT_PWM_CHANNEL, BACKLIGHT_FULL);  // Turn on backlight
+  ledcWrite(BACKLIGHT_PWM_CHANNEL, BACKLIGHT_FULL);  // Turn on backlight at low brightness
   pinMode(BATTERY_PIN, INPUT);  // Configure battery ADC pin
   analogReadResolution(12);      // 12-bit ADC resolution (0-4095)
   checkBattery();                // Initial battery check
@@ -815,75 +636,38 @@ void setup() {
 
   if (wifiConnected) {
     tft.fillScreen(COLOR_BG);
-    tft.drawString("Loading data...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 2);
+    tft.drawString("Loading...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 2);
 
     // Fetch current price immediately
     Serial.println("[INIT] Fetching current price...");
     if (fetchCurrentPrice(currentPrice)) {
-      priceNeedsRedraw = true;
       Serial.println("[INIT] Price fetched successfully");
+      drawPrice(currentPrice, true);
     } else {
       Serial.println("[INIT] Price fetch failed");
+      drawPrice(0, false);
     }
 
-    // Draw header with BTC label
-    Serial.println("[INIT] Drawing header...");
-    drawHeader();
+    // Disconnect WiFi to save power
+    disconnectWifi();
 
-    // Wait before fetching chart data (rate limiting)
-    tft.drawString("Waiting for chart...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 20, 1);
-    Serial.println("[INIT] Waiting 20 seconds before chart fetch (rate limiting)...");
-    unsigned long waitUntil = millis() + 20000;
-    while (millis() < waitUntil) {
-      checkBattery();
-      delay(100);
-    }
-    Serial.println("[INIT] Wait complete, fetching chart data...");
-
-    // Fetch 7-day chart data
-    if (fetchWeekPrices(weekPrices)) {
-      chartNeedsRedraw = true;
-      Serial.println("[INIT] Chart data fetched successfully");
-    } else {
-      Serial.println("[INIT] Chart fetch failed - will retry later");
-    }
-
-    // Initial draw
-    Serial.println("[INIT] Drawing initial display...");
-    if (chartNeedsRedraw) {
-      tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
-      drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-      drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-      drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-      chartNeedsRedraw = false;
-      Serial.println("[INIT] Chart drawn");
-    }
-
-    if (priceNeedsRedraw) {
-      drawPrice(String((int)currentPrice), currentPrice > 0);
-      priceNeedsRedraw = false;
-      Serial.println("[INIT] Price drawn");
-    }
-
-    lastChartUpdate = millis();
     lastPriceUpdate = millis();
     lastFirmwareCheck = millis();
 
   } else {
     tft.fillScreen(COLOR_BG);
-    drawHeader();
     tft.setTextColor(COLOR_ERROR, COLOR_BG);
     tft.drawString("WiFi Error!", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 4);
   }
 
   Serial.println("\n[INIT] Setup complete!");
-  Serial.println("[INIT] Device ready - real-time price updates enabled");
+  Serial.println("[INIT] Device ready - WiFi will reconnect for updates");
   Serial.print("[INIT] Price update interval: ");
-  Serial.print(PRICE_UPDATE_INTERVAL_BASE / 1000);
-  Serial.println(" seconds");
-  Serial.print("[INIT] Chart update interval: ");
-  Serial.print(CHART_UPDATE_INTERVAL_BASE / 60000);
-  Serial.println(" minutes");
+  Serial.print(PRICE_UPDATE_INTERVAL_BASE / 3600000);
+  Serial.println(" hours");
+  Serial.print("[INIT] Firmware update interval: ");
+  Serial.print(FIRMWARE_UPDATE_INTERVAL / 3600000);
+  Serial.println(" hours");
 }
 
 void loop() {
@@ -897,7 +681,7 @@ void loop() {
       drawBatteryWarning();
     }
 
-    // Check if device is plugged in (for automatic firmware updates)
+    // Check if device is plugged in (for battery display indicator)
     wasPluggedIn = isPluggedIn;
     isPluggedIn = checkIfPluggedIn();
 
@@ -907,7 +691,6 @@ void loop() {
       Serial.print("[POWER] Voltage: ");
       Serial.print(batteryVoltage, 2);
       Serial.println("V (charging)");
-      firmwareCheckedThisSession = false;  // Reset flag for new plug-in session
       drawBatteryWarning();  // Update display to show charging indicator
     }
 
@@ -921,38 +704,20 @@ void loop() {
     }
   }
 
-  // --- Automatic firmware update when plugged in ---
-  if (isPluggedIn && !firmwareCheckedThisSession) {
-    Serial.println("\n[OTA] 🔌 Plugged in - checking for firmware updates...");
+  // Check if any updates are needed
+  bool needsPriceUpdate = (now - lastPriceUpdate >= PRICE_UPDATE_INTERVAL);
+  bool needsFirmwareUpdate = (now - lastFirmwareCheck >= FIRMWARE_UPDATE_INTERVAL);
 
-    // Connect WiFi if needed
+  // --- Price update ---
+  if (needsPriceUpdate) {
+    Serial.println("\n[UPDATE] Fetching price...");
+
+    // Reconnect WiFi for price update
     if (!wifiConnected) {
       connectWifi();
     }
 
     if (wifiConnected) {
-      // Check for firmware update
-      bool updateFound = checkForFirmwareUpdate();
-      firmwareCheckedThisSession = true;  // Mark as checked
-
-      if (!updateFound) {
-        Serial.println("[OTA] No updates found - firmware is current");
-      }
-    }
-  }
-
-  // Check if any updates are needed
-  bool needsPriceUpdate = (now - lastPriceUpdate >= PRICE_UPDATE_INTERVAL);
-  bool needsChartUpdate = (now - lastChartUpdate >= CHART_UPDATE_INTERVAL);
-  bool needsFirmwareUpdate = (now - lastFirmwareCheck >= FIRMWARE_UPDATE_INTERVAL);
-
-  // Perform updates (WiFi stays connected)
-  if (needsPriceUpdate || needsChartUpdate || needsFirmwareUpdate) {
-
-    // --- Price update ---
-    if (needsPriceUpdate && wifiConnected) {
-      Serial.println("\n[UPDATE] Fetching price...");
-
       // Apply exponential backoff if there have been consecutive failures
       if (consecutiveApiFailures > 0) {
         int backoff = calculateBackoff(consecutiveApiFailures);
@@ -973,47 +738,36 @@ void loop() {
       bool success = fetchCurrentPrice(currentPrice);
 
       if (success) {
-        // Redraw chart and price
-        tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
-
-        if (weekPrices.size() > 0) {
-          drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-          drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-          drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-        }
-
-        drawPrice(String((int)currentPrice), success);
-        drawBatteryWarning();
+        drawPrice(currentPrice, true);
+      } else {
+        drawPrice(currentPrice, false);
       }
 
-      lastPriceUpdate = now;
-      PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE + random(0, 10000);
+      // Disconnect WiFi to save power
+      disconnectWifi();
     }
 
-    // --- Chart update ---
-    if (needsChartUpdate && wifiConnected) {
-      Serial.println("\n[UPDATE] Fetching chart...");
-      bool success = fetchWeekPrices(weekPrices);
+    lastPriceUpdate = now;
+    PRICE_UPDATE_INTERVAL = PRICE_UPDATE_INTERVAL_BASE + random(0, 10000);
+  }
 
-      if (success) {
-        tft.fillRect(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT, COLOR_BG);
-        drawGrid(CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-        drawSeries(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-        drawChartLabels(weekPrices, CHART_X, CHART_Y, CHART_WIDTH, CHART_HEIGHT);
-        drawPrice(String((int)currentPrice), currentPrice > 0);
-        drawBatteryWarning();
-      }
+  // --- Firmware update check ---
+  if (needsFirmwareUpdate) {
+    Serial.println("\n[UPDATE] Checking for firmware updates...");
 
-      lastChartUpdate = now;
-      CHART_UPDATE_INTERVAL = CHART_UPDATE_INTERVAL_BASE + random(0, 30000);
+    // Reconnect WiFi for firmware update check
+    if (!wifiConnected) {
+      connectWifi();
     }
 
-    // --- Firmware update check ---
-    if (needsFirmwareUpdate && wifiConnected) {
-      Serial.println("\n[UPDATE] Checking for firmware updates...");
+    if (wifiConnected) {
       checkForFirmwareUpdate();
-      lastFirmwareCheck = now;
+
+      // Disconnect WiFi to save power (only if update didn't happen - update restarts device)
+      disconnectWifi();
     }
+
+    lastFirmwareCheck = now;
   }
 
   delay(100);  // Small delay to prevent busy-waiting
@@ -1031,7 +785,7 @@ void configurePowerSaving() {
 
   Serial.println("[POWER] Power management initialized");
   Serial.println("[POWER] Display always-on mode (encased device)");
-  Serial.println("[POWER] WiFi stays connected for real-time price updates");
+  Serial.println("[POWER] WiFi disconnects between updates to save power");
 }
 
 void checkBattery() {
@@ -1092,28 +846,28 @@ bool checkIfPluggedIn() {
 void drawBatteryWarning() {
   if (batteryCritical) {
     // Critical: Red, blinking (will shut down)
-    tft.setTextColor(COLOR_ERROR, COLOR_HEADER);
+    tft.setTextColor(COLOR_ERROR, COLOR_BG);
     tft.setTextDatum(TR_DATUM);
     tft.drawString("CRITICAL", SCREEN_WIDTH - 2, 2, 1);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(String(batteryVoltage, 2) + "V", SCREEN_WIDTH - 2, 12, 1);
   } else if (isPluggedIn) {
     // Plugged in: Green, show charging indicator
-    tft.setTextColor(COLOR_CHART, COLOR_HEADER);
+    tft.setTextColor(COLOR_CHART, COLOR_BG);
     tft.setTextDatum(TR_DATUM);
     tft.drawString("CHARGING", SCREEN_WIDTH - 2, 2, 1);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(String(batteryVoltage, 2) + "V", SCREEN_WIDTH - 2, 12, 1);
   } else if (batteryLow) {
     // Low: Yellow/Orange warning
-    tft.setTextColor(COLOR_WARNING, COLOR_HEADER);
+    tft.setTextColor(COLOR_WARNING, COLOR_BG);
     tft.setTextDatum(TR_DATUM);
     tft.drawString("LOW", SCREEN_WIDTH - 2, 2, 1);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(String(batteryVoltage, 2) + "V", SCREEN_WIDTH - 2, 12, 1);
   } else {
     // Clear the warning area if battery is OK
-    tft.fillRect(SCREEN_WIDTH - 50, 0, 50, 22, COLOR_HEADER);
+    tft.fillRect(SCREEN_WIDTH - 50, 0, 50, 22, COLOR_BG);
   }
 }
 
